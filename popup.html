@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'" />
+  <title>Network Logger</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="logo">
+        <img src="icons/icon32.png" alt="" class="logo-icon-img" />
+        <div>
+          <div class="logo-title">Network Logger</div>
+          <div class="logo-sub">HAR Exporter</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme" title="Toggle light/dark theme">🌙</button>
+        <div id="status-badge" class="status-badge idle">● IDLE</div>
+      </div>
+    </div>
+
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+      <div class="stat">
+        <span class="stat-value" id="request-count">0</span>
+        <span class="stat-label">Requests</span>
+      </div>
+      <div class="stat-divider"></div>
+      <div class="stat">
+        <span class="stat-value" id="elapsed-time">00:00</span>
+        <span class="stat-label">Duration</span>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="controls">
+      <button id="btn-start" class="btn btn-primary">
+        <span class="btn-icon">▶</span> Start Recording
+      </button>
+      <button id="btn-stop" class="btn btn-danger" disabled>
+        <span class="btn-icon">■</span> Stop Recording
+      </button>
+    </div>
+
+    <!-- Info Box -->
+    <div id="info-box" class="info-box">
+      <span id="info-text">Press <strong>Start Recording</strong> to begin capturing network requests across all tabs.</span>
+    </div>
+
+    <!-- Export Options -->
+    <div class="options-panel">
+      <div class="options-header">Export Options</div>
+      <div class="options-body">
+        <div class="option-group">
+          <label class="option-group-label">FILENAME</label>
+          <div class="filename-row">
+            <input type="text" id="filename-input" class="filename-input" placeholder="network-log (auto-timestamped)" spellcheck="false" />
+            <span class="filename-suffix">.har</span>
+          </div>
+        </div>
+        <div class="option-group scrub-row">
+          <div class="scrub-text">
+            <span class="scrub-title">Scrub sensitive data</span>
+            <span class="scrub-hint">Redacts tokens, cookies &amp; passwords</span>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="scrub-toggle" checked />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export Section -->
+    <div class="export-section">
+      <button id="btn-export" class="btn btn-export" disabled>
+        <span class="btn-icon">⬇</span> Export as HAR
+      </button>
+      <button id="btn-clear" class="btn btn-secondary" disabled>
+        <span class="btn-icon">🗑</span> Clear
+      </button>
+    </div>
+
+    <!-- Security Notice -->
+    <div id="security-notice" class="security-notice">
+      ⚠️ HAR files contain <strong>passwords, tokens &amp; cookies</strong>. Do not share them publicly.
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      v1.2.0 · HAR 1.2 · All data stays local
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
