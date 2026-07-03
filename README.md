@@ -1,5 +1,7 @@
 # Network Logger - Firefox HAR Exporter
 
+[中文](README.md) | [English](README_EN.md)
+
 这是一个用于 Firefox 的网络请求记录插件，可以跨标签页捕获浏览器发出的网络请求，并导出为 HAR 1.2 文件。
 
 本项目基于 [themindfuel-ai/network-logger](https://github.com/themindfuel-ai/network-logger) 修改而来，主要改造目标是兼容 Firefox，并保留原有的 HAR 导出使用体验。
