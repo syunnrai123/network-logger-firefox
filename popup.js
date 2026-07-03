@@ -241,7 +241,7 @@ btnStop.addEventListener("click", async () => {
     const res = await sendMsg("stopRecording");
     stopTimer();
     stopPolling();
-    scrubToggle.checked = true;
+    scrubToggle.checked = false;
     updateUI(false, res.count || 0);
   } catch (err) {
     setInfo(`❌ Could not stop: ${err.message}`, "error");
@@ -255,7 +255,7 @@ btnClear.addEventListener("click", async () => {
     await sendMsg("clearRecording");
     stopTimer();
     stopPolling();
-    scrubToggle.checked = true;
+    scrubToggle.checked = false;
     elapsedTime.textContent = "00:00";
     updateUI(false, 0);
   } catch (err) {
