@@ -139,13 +139,18 @@ function concatChunks(chunks, totalBytes) {
 }
 
 function bytesToBase64(bytes) {
-  let binary = "";
+  // Build the binary string in chunked parts rather than a single spread
+  // call. Each chunk is appended to an array and joined once, which avoids
+  // creating a giant transient argument list and keeps peak memory lower
+  // for large binary bodies. Output is byte-for-byte identical to a plain
+  // fromCharCode loop (RFC 4648 base64).
   const chunkSize = 0x8000;
+  const parts = [];
   for (let i = 0; i < bytes.length; i += chunkSize) {
     const slice = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...slice);
+    parts.push(String.fromCharCode.apply(null, slice));
   }
-  return btoa(binary);
+  return btoa(parts.join(""));
 }
 
 function canDecodeUtf8(bytes) {
@@ -495,26 +500,33 @@ function scrubUrl(url) {
 }
 
 function scrubEntry(entry) {
-  const e = JSON.parse(JSON.stringify(entry));
-  e.request.url = scrubUrl(e.request.url);
-  e.request.headers = scrubHeaders(e.request.headers);
-  e.request.cookies = scrubCookies(e.request.cookies);
-  if (e.request.queryString) {
-    e.request.queryString = e.request.queryString.map(q =>
+  // buildEntry() already produces a fresh object tree: nested arrays
+  // (headers, cookies, queryString) are newly allocated and string fields
+  // are immutable, so assigning a scrubbed value creates a new string and
+  // never mutates the original `requests` map entry. The previous
+  // JSON.parse(JSON.stringify(entry)) deep clone was therefore redundant
+  // and doubled peak memory during export — we now scrub in place. This
+  // is safe even across repeated exports because each downloadHAR call
+  // runs buildHAR() again and produces brand-new entry objects.
+  entry.request.url = scrubUrl(entry.request.url);
+  entry.request.headers = scrubHeaders(entry.request.headers);
+  entry.request.cookies = scrubCookies(entry.request.cookies);
+  if (entry.request.queryString) {
+    entry.request.queryString = entry.request.queryString.map(q =>
       SENSITIVE_QUERY_PARAMS.has(q.name.toLowerCase())
         ? { name: q.name, value: REDACTED }
         : q
     );
   }
-  if (e.request.postData && e.request.postData.text && !e.request.postData.encoding) {
-    e.request.postData.text = scrubBodyText(e.request.postData.text);
+  if (entry.request.postData && entry.request.postData.text && !entry.request.postData.encoding) {
+    entry.request.postData.text = scrubBodyText(entry.request.postData.text);
   }
-  e.response.headers = scrubHeaders(e.response.headers);
-  e.response.cookies = scrubCookies(e.response.cookies);
-  if (e.response.content && e.response.content.text && !e.response.content.encoding) {
-    e.response.content.text = scrubBodyText(e.response.content.text);
+  entry.response.headers = scrubHeaders(entry.response.headers);
+  entry.response.cookies = scrubCookies(entry.response.cookies);
+  if (entry.response.content && entry.response.content.text && !entry.response.content.encoding) {
+    entry.response.content.text = scrubBodyText(entry.response.content.text);
   }
-  return e;
+  return entry;
 }
 
 // --- Firefox webRequest event handlers --------------------------------------
@@ -615,20 +627,137 @@ api.webRequest.onCompleted.addListener(onCompleted, allUrls);
 api.webRequest.onErrorOccurred.addListener(onErrorOccurred, allUrls);
 
 // --- Download ----------------------------------------------------------------
-async function downloadHARFile(json, filename) {
-  const blob = new Blob([json], { type: "application/octet-stream" });
+// Streams the HAR out as a list of Blob parts instead of a single giant
+// JSON string. The log header is serialized once; each entry is serialized
+// on its own and appended to the parts array. Firefox may page large Blob
+// data to a temporary file, so peak memory during export is roughly one
+// entry's JSON plus the assembled Blob handle, instead of N full copies
+// (object graph + giant string + Blob) of the whole capture.
+async function downloadHARStream(har, filename) {
+  const parts = [];
+
+  // Serialize log metadata dynamically so any field buildHAR() adds to
+  // har.log in the future (pages, comment, ...) is picked up automatically
+  // instead of being silently dropped. Strip the trailing '}' from the
+  // serialized metadata and splice in ',"entries":[' to reopen the array.
+  const logMeta = { ...har.log };
+  delete logMeta.entries;
+  const logMetaJson = JSON.stringify(logMeta);
+  const logOpen = logMetaJson === "{}"
+    ? `{"entries":[`
+    : `${logMetaJson.slice(0, -1)},"entries":[`;
+  parts.push(`{"log":${logOpen}`);
+
+  const entries = har.log.entries;
+  let written = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const chunk = JSON.stringify(entries[i]);
+    // JSON.stringify returns undefined only for top-level functions/symbols,
+    // which would silently corrupt the array syntax — abort loudly instead
+    // of shipping a truncated HAR.
+    if (chunk === undefined) {
+      const url = entries[i] && entries[i].request ? entries[i].request.url : "unknown";
+      throw new Error(`Entry ${i} could not be serialized (${url})`);
+    }
+    // Newline-separated so each entry sits on its own line — keeps the file
+    // scannable in a text editor without paying for 2-space indentation.
+    parts.push(written === 0 ? "\n" : ",\n");
+    parts.push(chunk);
+    written++;
+  }
+
+  if (written !== entries.length) {
+    throw new Error(`HAR integrity check failed: wrote ${written} of ${entries.length} entries`);
+  }
+
+  parts.push("\n]}}");
+
+  const blob = new Blob(parts, { type: "application/octet-stream" });
   const url = URL.createObjectURL(blob);
+
+  let downloadId;
   try {
-    await api.downloads.download({
+    downloadId = await api.downloads.download({
       url,
       filename,
       conflictAction: "uniquify",
       saveAs: false
     });
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
   } catch (err) {
     URL.revokeObjectURL(url);
     throw err;
+  }
+
+  // Revoke the blob URL when the download actually finishes (or fails)
+  // instead of on a fixed 60s timer. This releases the underlying Blob
+  // data as soon as the browser is done reading it — a 2-second download
+  // no longer pins a multi-hundred-MB blob for a full minute. A safety
+  // timeout catches cases where onChanged never fires (e.g. the saveAs
+  // dialog is left open) so the listener doesn't leak indefinitely.
+  // Note: revokeObjectURL() does NOT interrupt an in-flight transfer —
+  // the browser holds its own reference once the download has started.
+  const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
+  let settled = false;
+  let safetyTimer;
+  let onChanged;
+
+  // Revoke the blob URL and detach the listener. Called only when we know
+  // the download has settled (onChanged reported complete/interrupted, or
+  // a search confirmed the same) — at that point the browser has finished
+  // reading the blob and revokeObjectURL() is safe.
+  const revokeAndDetach = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(safetyTimer);
+    try { api.downloads.onChanged.removeListener(onChanged); } catch {}
+    URL.revokeObjectURL(url);
+  };
+
+  onChanged = (delta) => {
+    if (delta.id !== downloadId || !delta.state) return;
+    const state = delta.state.current;
+    if (state === "complete" || state === "interrupted") revokeAndDetach();
+  };
+
+  // Safety net for when onChanged never fires (Firefox bug 1344822: a
+  // saveAs dialog left open can suppress the event). Query the current
+  // state first: if the download has settled, revoke; otherwise just
+  // remove the listener. We deliberately do NOT revoke while the download
+  // is still in_progress — bug 2005952 shows that revoking a blob URL
+  // before the transfer has started can abort the download (e.g. when the
+  // user has Firefox set to "always ask where to save", which overrides
+  // our saveAs:false). Conservative: prefer a leaked blob URL over an
+  // aborted download, since this extension is used for reverse engineering
+  // where data integrity matters more than prompt memory release.
+  safetyTimer = setTimeout(async () => {
+    if (settled) return;
+    let currentState = null;
+    try {
+      const items = await api.downloads.search({ id: downloadId });
+      currentState = items && items[0] && items[0].state;
+    } catch {
+      // Search failed — leave currentState null, fall through to the
+      // conservative path below (detach only, do not revoke).
+    }
+    if (currentState === "complete" || currentState === "interrupted") {
+      revokeAndDetach();
+    } else {
+      // Still in_progress or unknown — detach the listener but leave the
+      // blob URL alive so a stalled download can still complete.
+      settled = true;
+      try { api.downloads.onChanged.removeListener(onChanged); } catch {}
+    }
+  }, SAFETY_TIMEOUT_MS);
+
+  try {
+    api.downloads.onChanged.addListener(onChanged);
+    // Close the race: if the download already finished between download()
+    // resolving and the listener attaching, query the current state once.
+    const items = await api.downloads.search({ id: downloadId });
+    const state = items && items[0] && items[0].state;
+    if (state === "complete" || state === "interrupted") revokeAndDetach();
+  } catch {
+    // If search or addListener throws, the safety timer still detaches.
   }
 }
 
@@ -686,13 +815,15 @@ async function handleMessage(message, sender) {
       if (FEATURES.scrubbing && message.scrubSensitive) {
         har.log.entries = har.log.entries.map(scrubEntry);
       }
-      const json = JSON.stringify(har, null, 2);
       const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
       const baseName = (FEATURES.customFilename && message.customFilename)
         ? sanitizeFilename(message.customFilename)
         : `network-log-${ts}`;
       const filename = `${baseName}.har`;
-      await downloadHARFile(json, filename);
+      // downloadHARStream() owns the integrity check: it throws on entry-
+      // count mismatch, serialization failure, or download API error.
+      // Any throw propagates through handleMessage's catch to the popup.
+      await downloadHARStream(har, filename);
       return { success: true, count: har.log.entries.length };
     }
 
