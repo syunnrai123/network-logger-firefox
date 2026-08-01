@@ -6,12 +6,12 @@
         <entry key="0">
           <value>
             <TabSessionState>
-              <option name="provider" value="codex" />
-              <option name="sessionId" value="019f2657-4b0e-7cd2-8775-55285448e214" />
-              <option name="cwd" value="$PROJECT_DIR$" />
-              <option name="model" value="gpt-5.5" />
+              <option name="provider" value="claude" />
+              <option name="sessionId" value="3a722afa-617a-4fc3-918f-42afcaba4454" />
+              <option name="cwd" value="C:\Users\S\Desktop\network-logger-firefox" />
+              <option name="model" value="claude-sonnet-4-7[1m]" />
               <option name="permissionMode" value="bypassPermissions" />
-              <option name="reasoningEffort" value="xhigh" />
+              <option name="reasoningEffort" value="max" />
             </TabSessionState>
           </value>
         </entry>

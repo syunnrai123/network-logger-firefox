@@ -26,7 +26,6 @@
       }
    },
    "description": "Capture network requests across all tabs and export as a HAR file — no DevTools needed. Perfect for debugging and sharing logs.",
-   "homepage_url": "https://themindfuel-ai.github.io/network-logger/",
    "icons": {
       "128": "icons/icon128.png",
       "16": "icons/icon16.png",
@@ -36,5 +35,5 @@
    "manifest_version": 2,
    "name": "Network Logger - HAR Exporter",
    "permissions": [ "storage", "webRequest", "webRequestBlocking", "downloads", "\u003Call_urls>" ],
-   "version": "1.2.0"
+   "version": "1.2.1"
 }

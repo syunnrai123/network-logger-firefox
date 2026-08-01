@@ -76,7 +76,26 @@ npx --yes web-ext lint --source-dir .
 - 开始录制之前已经发出的请求不会被捕获
 - Firefox 内部页面、扩展页面、部分浏览器保留页面无法捕获
 - 隐私窗口中的请求取决于 Firefox 是否允许该扩展在隐私窗口运行
-- 大体积响应会占用较多内存，因为导出 HAR 需要缓存响应体
+- 单个响应体超过 50MB 或请求体超过 8MB 时会被截断保留（响应仍正常返回给页面，不影响浏览），导出时通过 `_bodyTruncated` / `postData._error` 标记说明
+- 重定向链只记录初始 URL 与最终状态（webRequest API 不提供逐跳链路信息）
+- 失败请求会以 `status: 0` 保留在 HAR 中，错误原因记录在 `response._error` 扩展字段
+- 图片、媒体资源类型不缓存响应体（字体保留，供字体逆向使用），其 `content.size` 取自 content-length（可能为压缩后大小）
+
+## 导出字段说明
+
+为方便逆向分析，导出的 HAR 在标准字段外附带以下扩展字段（下划线前缀，HAR 消费者会忽略未知字段）：
+
+- `request._resourceType` — 资源类型（image/script/xhr/font/websocket 等）
+- 条目顶层 `_originUrl` / `_documentUrl` — 请求发起者来源与所在文档 URL
+- 条目顶层 `_tabId` / `_frameId` / `_incognito` / `_thirdParty` — 请求归属上下文
+- 条目顶层 `_ip` / `_fromCache` / `_proxyInfo` — 服务器 IP、是否命中缓存、代理信息
+- `response._error` — 失败请求的错误原因（如 DNS 解析失败、连接被拒）
+- `response.content._decodedFrom` — 原始传输编码（gzip/br），`content.text` 为解压后内容
+- `response.content._bodySkipped` — 图片/媒体响应体按策略跳过捕获
+- `response.content._bodyTruncated` — 响应体超过保留上限被截断，`content.text` 为截断后部分
+- `request.postData._error` — 请求体捕获受限或被截断时的原因说明
+
+`log.pages` 按标签页对请求分组，entry 通过 `pageref` 关联到对应 page。
 
 ## 来源声明
 

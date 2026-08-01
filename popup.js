@@ -147,6 +147,10 @@ function updateUI(recording, count = 0) {
     btnStop.disabled = true;
   }
 
+  // Stop 按钮的 "⏳ Stopping…" 只是点击后的瞬态;状态切换时必须恢复默认文案,
+  // 否则按钮会一直停留在 Stopping…(包括重新开始录制后仍显示错误文案)。
+  btnStop.innerHTML = '<span class="btn-icon">■</span> Stop Recording';
+
   requestCount.textContent = count;
 }
 
@@ -212,7 +216,10 @@ async function exportHAR() {
     }
 
     const scrubNote = scrub ? " (sensitive data scrubbed)" : "";
-    setInfo(`✅ HAR saved — ${res.count} request${res.count !== 1 ? "s" : ""} exported${scrubNote}.`, "success");
+    const failNote = res.failedCount
+      ? ` · ${res.failedCount} failed request${res.failedCount !== 1 ? "s" : ""}`
+      : "";
+    setInfo(`✅ HAR saved — ${res.count} request${res.count !== 1 ? "s" : ""} exported${scrubNote}${failNote}.`, "success");
     btnExport.disabled = false;
     btnExport.innerHTML = '<span class="btn-icon">⬇</span> Export as HAR';
   } catch (err) {
@@ -238,12 +245,19 @@ btnStart.addEventListener("click", async () => {
 
 btnStop.addEventListener("click", async () => {
   try {
+    // Stop 在后台需要等待尚未完成的响应体捕获(最长约 10s),给出明确反馈,
+    // 避免用户以为按钮卡死。
+    btnStop.disabled = true;
+    btnStop.innerHTML = '<span class="btn-icon">⏳</span> Stopping…';
+    setInfo("⏳ Stopping… waiting for in-flight responses.", "warning");
     const res = await sendMsg("stopRecording");
     stopTimer();
     stopPolling();
     scrubToggle.checked = false;
     updateUI(false, res.count || 0);
   } catch (err) {
+    btnStop.disabled = false;
+    btnStop.innerHTML = '<span class="btn-icon">■</span> Stop Recording';
     setInfo(`❌ Could not stop: ${err.message}`, "error");
   }
 });

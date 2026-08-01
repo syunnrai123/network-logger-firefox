@@ -76,7 +76,26 @@ The current version passes Firefox extension validation:
 - Requests sent before recording starts are not captured
 - Firefox internal pages, extension pages, and some browser-reserved pages cannot be captured
 - Requests in private windows depend on whether Firefox allows this extension to run in private windows
-- Large responses may use more memory because HAR export requires caching response bodies
+- Single response bodies over 50MB or request bodies over 8MB are truncated (the response still streams to the page normally); exports mark this via `_bodyTruncated` / `postData._error`
+- Redirect chains record only the initial URL and the final status (the webRequest API does not expose per-hop information)
+- Failed requests are kept with `status: 0`; the failure reason is recorded in the `response._error` extension field
+- Response bodies of image/media resources are not cached (fonts are kept for font reverse engineering); their `content.size` is taken from content-length (possibly the compressed size)
+
+## Exported Field Notes
+
+To help with reverse engineering, the exported HAR carries these extra fields beyond the standard ones (underscore-prefixed; HAR consumers ignore unknown fields):
+
+- `request._resourceType` — resource type (image/script/xhr/font/websocket, etc.)
+- Entry-level `_originUrl` / `_documentUrl` — the initiating URL and the document URL of the request
+- Entry-level `_tabId` / `_frameId` / `_incognito` / `_thirdParty` — request ownership context
+- Entry-level `_ip` / `_fromCache` / `_proxyInfo` — server IP, cache hit, proxy info
+- `response._error` — failure reason for failed requests (e.g. DNS resolution failed, connection refused)
+- `response.content._decodedFrom` — original transfer encoding (gzip/br); `content.text` is the decompressed content
+- `response.content._bodySkipped` — response bodies of image/media were skipped by policy
+- `response.content._bodyTruncated` — response body exceeded the retention cap; `content.text` is the truncated portion
+- `request.postData._error` — reason when the request body capture was limited or truncated
+
+`log.pages` groups requests by tab; each entry links to its page via `pageref`.
 
 ## Source Attribution
 
