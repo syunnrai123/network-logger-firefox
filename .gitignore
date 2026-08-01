@@ -1,0 +1,36 @@
+# ===== JetBrains / PyCharm =====
+# 忽略 .idea 下所有本地个性化文件,仅保留 .gitignore 与 inspectionProfiles
+.idea/*
+!.idea/.gitignore
+!.idea/inspectionProfiles/
+!.idea/inspectionProfiles/*
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.eggs/
+build/
+dist/
+
+# ===== 依赖 / 构建产物 =====
+node_modules/
+*.log
+
+# ===== 运行时输出 =====
+# 导出的 HAR 抓包文件与打包产物,不入库
+*.har
+*.zip
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ===== 编辑器 =====
+.vscode/
+*.swp
