@@ -33,10 +33,19 @@ function ignoreResult(result) {
   if (result && typeof result.catch === "function") result.catch(() => {});
 }
 
-// Firefox badge 只容纳约 4 个字符,超出会被截断。4 位以内显示精确数字,
-// 更大时压缩为 "9k+" 保证可读。
+// Firefox badge 空间约 4 个字符宽,但纯数字 4 位(如 "1234")在 Firefox 92+
+// 起会因 badge max-width 收窄被裁掉末位,显示成 "123"(见 bugzilla 1733844
+// / 1610063)。因此 3 位以内显示精确数字,4 位起改用 k 缩写 —— "1.2k" 这种
+// 数字+点+字母的组合实际宽度小于四个等宽数字,可完整显示,不再丢末位。
 function badgeText(count) {
-  return count > 9999 ? "9k+" : String(count);
+  if (count < 1000) return String(count);
+  if (count < 10000) {
+    // 1000-9999:保留一位小数的 k("1.2k");整千时省略小数("1k")
+    const k = (count / 1000).toFixed(1).replace(/\.0$/, "");
+    return `${k}k`;
+  }
+  // 10000 以上:取整到 k("12k"),超过 9.9 万固定 "99k+" 防止超宽
+  return count < 100000 ? `${Math.min(99, Math.round(count / 1000))}k` : "99k+";
 }
 
 function updateBadge() {
@@ -85,11 +94,18 @@ function getHeaderValue(headers, headerName) {
 function parseRequestCookies(headers) {
   const value = getHeaderValue(headers, "cookie");
   if (!value) return [];
-  return value.split(";").map(pair => {
-    const idx = pair.indexOf("=");
-    if (idx <= -1) return { name: pair.trim(), value: "" };
-    return { name: pair.slice(0, idx).trim(), value: pair.slice(idx + 1).trim() };
-  });
+  const cookies = [];
+  for (const pair of value.split(";")) {
+    const trimmed = pair.trim();
+    if (!trimmed) continue; // 连续分号("a=b;;c=d")会产生空段,跳过
+    const idx = trimmed.indexOf("=");
+    if (idx <= -1) {
+      cookies.push({ name: trimmed, value: "" });
+    } else {
+      cookies.push({ name: trimmed.slice(0, idx).trim(), value: trimmed.slice(idx + 1).trim() });
+    }
+  }
+  return cookies;
 }
 
 function parseResponseCookies(headers) {
@@ -212,30 +228,39 @@ function canDecodeUtf8(bytes) {
   }
 }
 
-// 超过此阈值且非文本 MIME 的响应体不做文本解码探测,直接 base64:
+// 超过此阈值一律不做文本解码,直接 base64:
 // 1) 随机二进制字节可能恰好整体是合法 UTF-8,误判为文本会让二进制不可还原;
-// 2) 省去对大字节数组的 UTF-8 探测与解码,降低 onstop 阶段的同步阻塞。
+// 2) 省去对大字节数组的 UTF-8 探测与解码,降低 onstop 阶段的同步阻塞;
+// 3) 大文本(如 50MB 的 text/plain)走文本解码时峰值内存约为源字节数的 4 倍
+//    (fatal 探测 + 解码 + 替换符扫描 + 结果字符串),对录制内存压力很大。
+//    逆向常用的 JSON/HTML/JS 响应体远小于该阈值,仍走文本路径保证可读性。
 const MAX_DECODE_BODY_BYTES = 1024 * 1024;
 
 function bytesToHarBody(bytes, headers) {
   const mimeType = getContentType(headers);
-  if (bytes.byteLength > MAX_DECODE_BODY_BYTES && !isTextContentType(mimeType)) {
+  if (bytes.byteLength > MAX_DECODE_BODY_BYTES) {
     return { text: bytesToBase64(bytes), encoded: true };
   }
-  const shouldDecode = isTextContentType(mimeType) || canDecodeUtf8(bytes);
+  const isUtf8 = canDecodeUtf8(bytes);
+  const shouldDecode = isTextContentType(mimeType) || isUtf8;
 
   if (shouldDecode) {
-    // 优先按声明的 charset 解码
+    // 优先按 UTF-8 解码:现代站点普遍输出 UTF-8。仅当字节不是合法 UTF-8
+    // (canDecodeUtf8 为 false,如 GBK/Shift_JIS 编码的中文)时才信任声明的
+    // charset。这样 iso-8859-1 / windows-1252 等单字节编码的声明不会把合法
+    // UTF-8 的中文静默解成乱码 —— 这类编码解码永不出 U+FFFD 替换符,
+    // 旧的 `includes("�")` 回退条件对它们完全失效。
     let text;
-    try {
-      text = new TextDecoder(getCharset(headers), { fatal: false }).decode(bytes);
-    } catch {
+    if (isUtf8) {
       text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-    }
-    // 声明编码解码出替换符(U+FFFD)而字节本身是合法 UTF-8 时回退 UTF-8,
-    // 避免错误的 charset 声明让中文等文本整体变乱码。
-    if (text.includes("�") && canDecodeUtf8(bytes)) {
-      text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    } else {
+      try {
+        text = new TextDecoder(getCharset(headers), { fatal: false }).decode(bytes);
+      } catch {
+        text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      }
+      // 字节非合法 UTF-8 时按声明编码解码;若声明也不对,utf-8(fatal:false)
+      // 输出替换符,保证 HAR 的 text 至少是合法字符串,不抛异常。
     }
     return { text, encoded: false };
   }
@@ -244,7 +269,12 @@ function bytesToHarBody(bytes, headers) {
 }
 
 function sanitizeFilename(name) {
-  let cleaned = name.replace(/\.har$/i, "").replace(/[<>:"/\\|?*]/g, "_").trim();
+  // \x00-\x1f 是 Windows 文件名非法控制字符,逐项删除比替换更安全
+  let cleaned = name
+    .replace(/\.har$/i, "")
+    .replace(/[\x00-\x1f]/g, "")
+    .replace(/[<>:"/\\|?*]/g, "_")
+    .trim();
   if (!cleaned) cleaned = "network-log";
   // Windows 保留设备名(CON/PRN/AUX/NUL/COM1-9/LPT1-9),带任意扩展名也不合法
   if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^.]+)?$/i.test(cleaned)) cleaned = "_" + cleaned;
@@ -596,7 +626,7 @@ function buildHAR() {
 
   const log = {
     version: "1.2",
-    creator: { name: "Network Logger", version: "1.2.1" },
+    creator: { name: "Network Logger", version: "1.2.2" },
     entries
   };
   // 注意:downloadHARStream 用 JSON.stringify(log).slice(0,-1) 拼接 entries,
@@ -857,7 +887,11 @@ function onHeadersReceived(details) {
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
   r.responseHeaders = details.responseHeaders || [];
-  r.waitTime = Math.max(0, details.timeStamp - r.startTime);
+  // waitTime 定义为"发送完成到收到响应头"的等待时长,减去 sendTime 避免
+  // 与 send 阶段重叠,使 HAR timings 三段(send/wait/receive)之和恰好等于
+  // 请求总耗时。sendTime 恒在 onHeadersReceived 之前由 onBeforeSendHeaders
+  // 写入,即使该事件缺失(值为 0)此式也退化为原来的全量等待时长。
+  r.waitTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime);
   // 对未捕获响应体(NON_BODY_TYPES)的请求,用 content-length 兜底记录大小;
   // 已捕获的请求会在 finalizeResponseBody 里用真实字节数覆盖此值。
   if (!r.responseBodySize) {
@@ -874,7 +908,7 @@ function onBeforeRedirect(details) {
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
   r.responseHeaders = details.responseHeaders || r.responseHeaders;
   r.redirectUrl = details.redirectUrl || "";
-  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.waitTime);
+  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
 }
 
 function onCompleted(details) {
@@ -883,7 +917,7 @@ function onCompleted(details) {
   r.status = details.statusCode || r.status;
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
-  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.waitTime);
+  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
   // 连接信息:服务器 IP 与是否命中缓存(判断"这请求是否真的走了网络")
   r.ip = details.ip || r.ip;
   r.fromCache = !!details.fromCache;
@@ -893,7 +927,7 @@ function onErrorOccurred(details) {
   const r = requests.get(details.requestId);
   if (!r) return;
   r.error = details.error || "Request failed";
-  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.waitTime);
+  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
   // 失败请求也能拿到目标 IP(DNS/连接阶段失败时可能为空)
   r.ip = details.ip || r.ip;
 }
@@ -1003,7 +1037,7 @@ async function downloadHARStream(har, filename) {
   onChanged = (delta) => {
     if (delta.id !== downloadId || !delta.state) return;
     const state = delta.state.current;
-    if (state === "complete" || state === "interrupted") revokeAndDetach();
+    if (state === "complete" || state === "interrupted" || state === "canceled") revokeAndDetach();
   };
 
   // Safety net for when onChanged never fires (Firefox bug 1344822: a
@@ -1026,7 +1060,7 @@ async function downloadHARStream(har, filename) {
       // Search failed — leave currentState null, fall through to the
       // conservative path below (detach only, do not revoke).
     }
-    if (currentState === "complete" || currentState === "interrupted") {
+    if (currentState === "complete" || currentState === "interrupted" || currentState === "canceled") {
       revokeAndDetach();
     } else {
       // Still in_progress or unknown — detach the listener but leave the
@@ -1042,7 +1076,7 @@ async function downloadHARStream(har, filename) {
     // resolving and the listener attaching, query the current state once.
     const items = await api.downloads.search({ id: downloadId });
     const state = items && items[0] && items[0].state;
-    if (state === "complete" || state === "interrupted") revokeAndDetach();
+    if (state === "complete" || state === "interrupted" || state === "canceled") revokeAndDetach();
   } catch {
     // If search or addListener throws, the safety timer still detaches.
   }
