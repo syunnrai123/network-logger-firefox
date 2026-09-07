@@ -16,8 +16,15 @@ const actionApi = api.action || api.browserAction;
 
 const requests = new Map();          // webRequest requestId -> request data
 const pendingBodyCaptures = new Set();
+const initiatorQueues = new Map();   // tabId -> [{url, method, frames, via, t}]
+const navLatest = new Map();         // tab:frame:url -> last restricted-nav requestId
 let isRecording = false;
 let recordingStartTime = null;
+let liveEntries = 0;
+let totalBodyBytes = 0;
+
+const MAX_LIVE_ENTRIES = 50000;
+const MAX_TOTAL_BODY_BYTES = 400 * 1024 * 1024;
 
 // --- Feature Flags -----------------------------------------------------------
 const FEATURES = {
@@ -26,7 +33,47 @@ const FEATURES = {
   customFilename: true,
   multiTab:       true,
   bodyCapture:    !!(api.webRequest && api.webRequest.filterResponseData),
+  redirectChain:  true,
+  callStack:      true,
+  restrictedNav:  !!(api.webNavigation && api.webNavigation.onCommitted),
 };
+
+function recordedCount() {
+  return liveEntries;
+}
+
+function storedBytes(r) {
+  return (r._countedRequestBytes || 0) + (r._countedResponseBytes || 0);
+}
+
+function forgetRequest(key) {
+  const r = requests.get(key);
+  if (!r) return;
+  // Drop this object from the HAR map but keep any live StreamFilter piping
+  // bytes to the page. Bump generation so a late finish() does not count
+  // the orphaned body against session totals.
+  r.filterGeneration = (r.filterGeneration || 0) + 1;
+  liveEntries -= 1 + (r.redirectHops && r.redirectHops.length ? r.redirectHops.length : 0);
+  totalBodyBytes -= storedBytes(r);
+  if (liveEntries < 0) liveEntries = 0;
+  if (totalBodyBytes < 0) totalBodyBytes = 0;
+  requests.delete(key);
+}
+
+function resetCaptureState() {
+  // Invalidate in-flight StreamFilters from the previous session so a late
+  // finish() cannot add bytes to the new session totals. Do not disconnect:
+  // those filters must keep piping the response to the page.
+  requests.forEach(r => {
+    r.filterGeneration = (r.filterGeneration || 0) + 1;
+  });
+  requests.clear();
+  pendingBodyCaptures.clear();
+  initiatorQueues.clear();
+  navLatest.clear();
+  liveEntries = 0;
+  totalBodyBytes = 0;
+}
 
 // --- Badge ------------------------------------------------------------------
 function ignoreResult(result) {
@@ -48,19 +95,40 @@ function badgeText(count) {
   return count < 100000 ? `${Math.min(99, Math.round(count / 1000))}k` : "99k+";
 }
 
-function updateBadge() {
+function paintBadge() {
   if (!FEATURES.badge || !actionApi) return;
+  const n = recordedCount();
 
   if (isRecording) {
-    const text = requests.size > 0 ? badgeText(requests.size) : "*";
+    const text = n > 0 ? badgeText(n) : "*";
     ignoreResult(actionApi.setBadgeText({ text }));
     ignoreResult(actionApi.setBadgeBackgroundColor({ color: "#ef4444" }));
-  } else if (requests.size > 0) {
-    ignoreResult(actionApi.setBadgeText({ text: badgeText(requests.size) }));
+  } else if (n > 0) {
+    ignoreResult(actionApi.setBadgeText({ text: badgeText(n) }));
     ignoreResult(actionApi.setBadgeBackgroundColor({ color: "#10b981" }));
   } else {
     ignoreResult(actionApi.setBadgeText({ text: "" }));
   }
+}
+
+// 每条请求都在 blocking 的 onBeforeRequest 里更新 badge 会打出大量 IPC。
+// 录制中节流到 100ms 一次;start/stop/clear 传 immediate 立即刷新。
+let badgePaintTimer = 0;
+function updateBadge(immediate) {
+  if (!FEATURES.badge || !actionApi) return;
+  if (immediate) {
+    if (badgePaintTimer) {
+      clearTimeout(badgePaintTimer);
+      badgePaintTimer = 0;
+    }
+    paintBadge();
+    return;
+  }
+  if (badgePaintTimer) return;
+  badgePaintTimer = setTimeout(() => {
+    badgePaintTimer = 0;
+    paintBadge();
+  }, 100);
 }
 
 // --- Utilities ---------------------------------------------------------------
@@ -75,6 +143,147 @@ function parseHeaders(headers) {
     return Object.entries(headers).map(([name, value]) => ({ name, value: String(value) }));
   }
   return [];
+}
+
+function cloneHeaders(headers) {
+  return parseHeaders(headers);
+}
+
+function urlKey(url) {
+  try {
+    const u = new URL(url);
+    u.hash = "";
+    return u.href;
+  } catch {
+    return String(url || "");
+  }
+}
+
+function parseStack(stack) {
+  if (!stack) return [];
+  const frames = [];
+  for (const raw of String(stack).split("\n")) {
+    if (frames.length >= 40) break;
+    const line = raw.trim();
+    if (!line || line === "Error") continue;
+    if (line.includes("page-hook.js") || line.includes("content-hook.js")) continue;
+    let m = /^(?:async\s*\*)?([^@]*)@(.+):(\d+):(\d+)$/.exec(line);
+    if (m) {
+      const file = m[2];
+      if (file.includes("page-hook.js")) continue;
+      frames.push({
+        functionName: (m[1] || "").trim() || "<anonymous>",
+        url: file,
+        line: Number(m[3]),
+        column: Number(m[4])
+      });
+      continue;
+    }
+    m = /^at\s+(?:(.+?)\s+\()?(\S+?):(\d+):(\d+)\)?$/.exec(line);
+    if (m) {
+      const file = m[2];
+      if (file.includes("page-hook.js")) continue;
+      frames.push({
+        functionName: (m[1] || "").trim() || "<anonymous>",
+        url: file,
+        line: Number(m[3]),
+        column: Number(m[4])
+      });
+    }
+  }
+  return frames;
+}
+
+function rememberInitiator(tabId, rec) {
+  if (typeof tabId !== "number" || tabId < 0) return;
+  let q = initiatorQueues.get(tabId);
+  if (!q) {
+    q = [];
+    initiatorQueues.set(tabId, q);
+  }
+  q.push(rec);
+  if (q.length > 300) q.splice(0, q.length - 300);
+}
+
+function takeInitiator(tabId, url, method, frameId) {
+  const q = initiatorQueues.get(tabId);
+  if (!q || !q.length) return null;
+  const now = Date.now();
+  const wantUrl = urlKey(url);
+  const wantMethod = String(method || "GET").toUpperCase();
+  const wantFrame = typeof frameId === "number" ? frameId : 0;
+  for (let i = 0; i < q.length; i++) {
+    const x = q[i];
+    if (now - x.t > 5000) continue;
+    if (x.method !== wantMethod) continue;
+    if ((x.frameId ?? 0) !== wantFrame) continue;
+    if (urlKey(x.url) !== wantUrl) continue;
+    q.splice(i, 1);
+    return x;
+  }
+  const kept = q.filter(x => now - x.t <= 5000);
+  if (kept.length) initiatorQueues.set(tabId, kept);
+  else initiatorQueues.delete(tabId);
+  return null;
+}
+
+const selfBaseUrl = (() => {
+  try { return api.runtime.getURL(""); } catch { return ""; }
+})();
+
+function isSelfUrl(url) {
+  return !!(selfBaseUrl && url && String(url).startsWith(selfBaseUrl));
+}
+
+function isRestrictedUrl(url) {
+  if (!url) return false;
+  const u = String(url).toLowerCase();
+  if (u === "about:blank" || u === "about:srcdoc") return false;
+  return u.startsWith("about:") ||
+    u.startsWith("moz-extension:") ||
+    u.startsWith("chrome:") ||
+    u.startsWith("resource:") ||
+    u.startsWith("view-source:") ||
+    u.startsWith("jar:");
+}
+
+function hopOrigin(r) {
+  return r.hopStartTime || r.startTime;
+}
+
+function methodKeepsBody(method) {
+  const m = String(method || "GET").toUpperCase();
+  return m !== "GET" && m !== "HEAD";
+}
+
+function ensureCapacity(protectId) {
+  while (requests.size && (liveEntries >= MAX_LIVE_ENTRIES || totalBodyBytes >= MAX_TOTAL_BODY_BYTES)) {
+    const oldestKey = requests.keys().next().value;
+    if (oldestKey === undefined) break;
+    if (protectId != null && oldestKey === protectId) {
+      if (requests.size === 1) break;
+      let skipped = null;
+      for (const key of requests.keys()) {
+        if (key !== protectId) {
+          skipped = key;
+          break;
+        }
+      }
+      if (skipped == null) break;
+      forgetRequest(skipped);
+      continue;
+    }
+    forgetRequest(oldestKey);
+  }
+}
+
+async function getIncognitoAllowed() {
+  if (!api.extension || typeof api.extension.isAllowedIncognitoAccess !== "function") return null;
+  try {
+    return await api.extension.isAllowedIncognitoAccess();
+  } catch {
+    return null;
+  }
 }
 
 function getHeaderValue(headers, headerName) {
@@ -129,7 +338,11 @@ function parseResponseCookies(headers) {
       const val = eq > -1 ? p.slice(eq + 1).trim() : "";
       if (key === "path") cookie.path = val;
       else if (key === "domain") cookie.domain = val;
-      else if (key === "expires") cookie.expires = val;
+      else if (key === "expires") {
+        // HAR 1.2 的 expires 是 ISO 8601;解析失败则保留原值以免丢信息
+        const ms = Date.parse(val);
+        cookie.expires = Number.isNaN(ms) ? val : new Date(ms).toISOString();
+      }
       else if (key === "max-age") cookie.maxAge = parseInt(val, 10) || 0;
       else if (key === "httponly") cookie.httpOnly = true;
       else if (key === "secure") cookie.secure = true;
@@ -158,19 +371,35 @@ function getContentType(headers) {
 function getCharset(headers) {
   const value = getHeaderValue(headers, "content-type");
   const match = /;\s*charset=([^;]+)/i.exec(value);
-  return match ? match[1].trim().replace(/^"|"$/g, "") : "utf-8";
+  return match ? match[1].trim().replace(/^["']|["']$/g, "") : "utf-8";
 }
 
 function isTextContentType(mimeType) {
   if (!mimeType) return false;
-  return mimeType.startsWith("text/") ||
-    /(?:json|xml|javascript|ecmascript|x-www-form-urlencoded|graphql|csv|svg)/i.test(mimeType);
+  if (mimeType.startsWith("text/")) return true;
+  // RFC 6838 structured syntax suffixes, e.g. application/vnd.api+json
+  if (mimeType.endsWith("+json") || mimeType.endsWith("+xml")) return true;
+  switch (mimeType) {
+    case "application/json":
+    case "application/xml":
+    case "application/javascript":
+    case "application/ecmascript":
+    case "application/x-javascript":
+    case "application/x-ecmascript":
+    case "application/x-www-form-urlencoded":
+    case "application/graphql":
+    case "application/csv":
+    case "image/svg+xml":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function httpVer(protocol, statusLine) {
   const source = (protocol || statusLine || "").toLowerCase();
-  if (source.includes("http/3") || source.includes("h3")) return "h3";
-  if (source.includes("http/2") || source.includes("h2")) return "h2";
+  if (source.includes("http/3") || source.includes("h3")) return "HTTP/3";
+  if (source.includes("http/2") || source.includes("h2")) return "HTTP/2";
   return "HTTP/1.1";
 }
 
@@ -228,56 +457,49 @@ function canDecodeUtf8(bytes) {
   }
 }
 
-// 超过此阈值一律不做文本解码,直接 base64:
-// 1) 随机二进制字节可能恰好整体是合法 UTF-8,误判为文本会让二进制不可还原;
-// 2) 省去对大字节数组的 UTF-8 探测与解码,降低 onstop 阶段的同步阻塞;
-// 3) 大文本(如 50MB 的 text/plain)走文本解码时峰值内存约为源字节数的 4 倍
-//    (fatal 探测 + 解码 + 替换符扫描 + 结果字符串),对录制内存压力很大。
-//    逆向常用的 JSON/HTML/JS 响应体远小于该阈值,仍走文本路径保证可读性。
+// 文本体超过此阈值一律 base64,避免大 text/plain 在 onstop 阶段做 UTF-8
+// 探测+解码时峰值内存约为源字节数的数倍。非文本 MIME 无论大小都走 base64,
+// 不会因为碰巧是合法 UTF-8(如 "PNG" 三字节)被误当成文本。
 const MAX_DECODE_BODY_BYTES = 1024 * 1024;
 
 function bytesToHarBody(bytes, headers) {
   const mimeType = getContentType(headers);
-  if (bytes.byteLength > MAX_DECODE_BODY_BYTES) {
+  if (bytes.byteLength === 0) return { text: "", encoded: false };
+  if (bytes.byteLength > MAX_DECODE_BODY_BYTES || !isTextContentType(mimeType)) {
     return { text: bytesToBase64(bytes), encoded: true };
   }
+
+  // 优先按 UTF-8 解码:现代站点普遍输出 UTF-8。仅当字节不是合法 UTF-8
+  // (canDecodeUtf8 为 false,如 GBK/Shift_JIS 编码的中文)时才信任声明的
+  // charset。这样 iso-8859-1 / windows-1252 等单字节编码的声明不会把合法
+  // UTF-8 的中文静默解成乱码 —— 这类编码解码永不出 U+FFFD 替换符,
+  // 旧的 `includes("�")` 回退条件对它们完全失效。
   const isUtf8 = canDecodeUtf8(bytes);
-  const shouldDecode = isTextContentType(mimeType) || isUtf8;
-
-  if (shouldDecode) {
-    // 优先按 UTF-8 解码:现代站点普遍输出 UTF-8。仅当字节不是合法 UTF-8
-    // (canDecodeUtf8 为 false,如 GBK/Shift_JIS 编码的中文)时才信任声明的
-    // charset。这样 iso-8859-1 / windows-1252 等单字节编码的声明不会把合法
-    // UTF-8 的中文静默解成乱码 —— 这类编码解码永不出 U+FFFD 替换符,
-    // 旧的 `includes("�")` 回退条件对它们完全失效。
-    let text;
-    if (isUtf8) {
+  let text;
+  if (isUtf8) {
+    text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  } else {
+    try {
+      text = new TextDecoder(getCharset(headers), { fatal: false }).decode(bytes);
+    } catch {
       text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-    } else {
-      try {
-        text = new TextDecoder(getCharset(headers), { fatal: false }).decode(bytes);
-      } catch {
-        text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-      }
-      // 字节非合法 UTF-8 时按声明编码解码;若声明也不对,utf-8(fatal:false)
-      // 输出替换符,保证 HAR 的 text 至少是合法字符串,不抛异常。
     }
-    return { text, encoded: false };
   }
-
-  return { text: bytesToBase64(bytes), encoded: true };
+  return { text, encoded: false };
 }
 
 function sanitizeFilename(name) {
-  // \x00-\x1f 是 Windows 文件名非法控制字符,逐项删除比替换更安全
+  // \x00-\x1f / DEL(\x7f) 是 Windows 文件名非法控制字符,删除比替换更安全
   let cleaned = name
     .replace(/\.har$/i, "")
-    .replace(/[\x00-\x1f]/g, "")
+    .replace(/[\x00-\x1f\x7f]/g, "")
     .replace(/[<>:"/\\|?*]/g, "_")
     .trim();
   if (!cleaned) cleaned = "network-log";
-  // Windows 保留设备名(CON/PRN/AUX/NUL/COM1-9/LPT1-9),带任意扩展名也不合法
-  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^.]+)?$/i.test(cleaned)) cleaned = "_" + cleaned;
+  // Windows 保留设备名(CON/PRN/AUX/NUL/COM1-9/LPT1-9)。按第一个 '.' 前的
+  // stem 判断,这样 CON.tar.gz 这类多段扩展名也会被挡住。
+  const stem = cleaned.split(".")[0];
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) cleaned = "_" + cleaned;
   // 文件名组件上限 ~255 字符(含 .har 扩展名),截断避免超长自定义名导致
   // downloads.download 直接报错而导出失败
   cleaned = cleaned.slice(0, 128);
@@ -313,13 +535,13 @@ function extractRequestBody(requestBody) {
     for (const part of requestBody.raw) {
       if (part.bytes) {
         const view = new Uint8Array(part.bytes);
-        const copy = new Uint8Array(view.byteLength);
-        copy.set(view);
-        if (totalBytes + copy.byteLength > MAX_REQUEST_BODY_BYTES) {
-          // 超限:丢弃剩余数据,标记错误让 HAR 说明请求体为何不完整
+        if (totalBytes + view.byteLength > MAX_REQUEST_BODY_BYTES) {
+          // 超限:先判断再拷贝,避免单块远超上限时在 blocking 路径上白分配
           result.error = `Request body truncated (exceeds ${MAX_REQUEST_BODY_BYTES} bytes)`;
           break;
         }
+        const copy = new Uint8Array(view.byteLength);
+        copy.set(view);
         chunks.push(copy);
         totalBytes += copy.byteLength;
       } else if (part.file) {
@@ -344,10 +566,21 @@ function extractRequestBody(requestBody) {
   if (requestBody.formData) {
     const params = [];
     const searchParams = new URLSearchParams();
+    let encodedSize = 0;
+    let truncated = false;
     for (const [name, values] of Object.entries(requestBody.formData)) {
+      if (truncated) break;
       const list = Array.isArray(values) ? values : [values];
       for (const value of list) {
         const textValue = String(value);
+        const sep = params.length ? 1 : 0;
+        const piece = sep + byteLength(encodeURIComponent(name)) + 1 + byteLength(encodeURIComponent(textValue));
+        if (encodedSize + piece > MAX_REQUEST_BODY_BYTES) {
+          result.error = `Request body truncated (exceeds ${MAX_REQUEST_BODY_BYTES} bytes)`;
+          truncated = true;
+          break;
+        }
+        encodedSize += piece;
         params.push({ name, value: textValue });
         searchParams.append(name, textValue);
       }
@@ -375,13 +608,18 @@ function finalizeResponseBody(request, chunks, totalBytes) {
   request.responseBody = body.text;
   request.responseBodyEncoded = body.encoded;
   request.responseBodySize = totalBytes;
+  totalBodyBytes -= request._countedResponseBytes || 0;
+  request._countedResponseBytes = totalBytes;
+  totalBodyBytes += totalBytes;
+  if (totalBodyBytes < 0) totalBodyBytes = 0;
+  if (totalBodyBytes >= MAX_TOTAL_BODY_BYTES) ensureCapacity(request.requestId);
 }
 
 // 不缓存这些资源类型的响应体。图片/媒体体积大且对文本分析无价值,跳过
 // 可显著降低导出时的峰值内存。注意 onBeforeRequest 阶段无法得知最终 MIME,
 // 因此这里按请求资源类型(而非 content-type)过滤。字体(font)必须保留:
 // 字体逆向依赖 woff2 原始二进制,且通常 <100KB,内存代价可忽略。
-const NON_BODY_TYPES = new Set(["image", "media"]);
+const NON_BODY_TYPES = new Set(["image", "imageset", "media"]);
 
 // 单个响应体保留上限。超过后停止累积数据(但仍原样转发给页面,不影响浏览),
 // 避免大文件下载(如 zip/octet-stream,不在 NON_BODY_TYPES 之列)把内存打爆。
@@ -392,9 +630,60 @@ const MAX_RESPONSE_BODY_BYTES = 50 * 1024 * 1024;
 // 一份显式保护,防止个别通道(如分块上传)把内存打爆。
 const MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024;
 
+function isDeadFilterError(err) {
+  const s = String(err || "").toLowerCase();
+  return s.includes("invalid request id") ||
+    s.includes("channel redirected") ||
+    s.includes("invalidchannel");
+}
+
+function isInternalRedirectHop(hop) {
+  if (!hop) return false;
+  const status = hop.status || 0;
+  const headers = hop.responseHeaders || [];
+  // HSTS / HTTPS upgrade: onBeforeRedirect fires with no real HTTP response.
+  if (status === 0) return true;
+  if (status < 300 && headers.length === 0) return true;
+  return false;
+}
+
+function shouldReattachFilter(existing) {
+  if (!FEATURES.bodyCapture) return false;
+  if (existing.responseBodySkipped) return false;
+  if (NON_BODY_TYPES.has(existing.type)) return false;
+  if ((existing._countedResponseBytes || 0) > 0) return false;
+  if (isDeadFilterError(existing.responseBodyError)) return true;
+  const hops = existing.redirectHops || [];
+  const last = hops[hops.length - 1];
+  if (isInternalRedirectHop(last)) return true;
+  // Continuation before onBeforeRedirect: only treat as STS if the first hop
+  // never sent headers. A real HTTP 302 has already gone through
+  // onBeforeSendHeaders.
+  if (!hops.length &&
+      !(existing.requestHeaders && existing.requestHeaders.length) &&
+      !existing.sendTime) {
+    return true;
+  }
+  return false;
+}
+
+function releaseStreamFilter(request) {
+  request.filterGeneration = (request.filterGeneration || 0) + 1;
+  const old = request._streamFilter;
+  request._streamFilter = null;
+  request.filterAttached = false;
+  if (old) {
+    try { old.disconnect(); } catch {}
+  }
+}
+
 function attachResponseFilter(requestId) {
   const request = requests.get(requestId);
   if (!request || !FEATURES.bodyCapture) return;
+  if (request.filterAttached) return;
+  request.filterAttached = true;
+  request.filterGeneration = (request.filterGeneration || 0) + 1;
+  const gen = request.filterGeneration;
   if (NON_BODY_TYPES.has(request.type)) {
     // 标记"有响应体但按策略跳过",让 HAR 导出能说明为什么没有 text
     request.responseBodySkipped = true;
@@ -412,25 +701,32 @@ function attachResponseFilter(requestId) {
   const chunks = [];
   let totalBytes = 0;
 
-  // 兜底 timer 句柄:finish() 正常结束后必须清掉,否则每个请求都会遗留一个
+  // 兜底 timer:finish() 正常结束后必须清掉,否则每个请求都会遗留一个
   // 存活 10 分钟的 timer(录制上万请求即上万并发空转 timer)。
-  let fallbackTimer;
+  // 初值为 0,finish 在 Promise 执行器里同步触发时 clearTimeout(0) 无害。
+  let fallbackTimer = 0;
+  let captureSettled = false;
 
   const captureDone = new Promise(resolve => {
     let resolved = false;
+    const stillCurrent = () => gen === request.filterGeneration;
     const finish = () => {
       if (resolved) return;
       resolved = true;
+      captureSettled = true;
       clearTimeout(fallbackTimer);
       try {
-        finalizeResponseBody(request, chunks, totalBytes);
+        if (stillCurrent()) finalizeResponseBody(request, chunks, totalBytes);
       } finally {
         pendingBodyCaptures.delete(captureDone);
         resolve();
       }
     };
 
+    request._streamFilter = filter;
+
     filter.ondata = event => {
+      if (!stillCurrent()) return;
       const data = event.data;
       if (!request.responseBodyTruncated && totalBytes + data.byteLength <= MAX_RESPONSE_BODY_BYTES) {
         const view = new Uint8Array(data);
@@ -461,7 +757,7 @@ function attachResponseFilter(requestId) {
     };
 
     filter.onerror = () => {
-      request.responseBodyError = filter.error || "Stream filter error";
+      if (stillCurrent()) request.responseBodyError = filter.error || "Stream filter error";
       try {
         filter.disconnect();
       } catch {
@@ -472,20 +768,39 @@ function attachResponseFilter(requestId) {
   });
 
   request.bodyCapturePromise = captureDone;
+  // onstop 若在 Promise 执行器里同步触发,finish 已跑完,不要再入 pending,
+  // 否则已 resolve 的 promise 会在集合里挂到 10 分钟兜底才删。
+  if (captureSettled) return;
+
   pendingBodyCaptures.add(captureDone);
 
   // 兜底:极端情况(如发起请求的标签页被立即关闭)下 onstop/onerror 可能都不
   // 触发,此时从 pending 集合移除标记,避免 waitForPendingBodies 无限等待。
   // 不调用 finish():onstop 未触发说明响应数据不完整,宁可不 finalize。
   fallbackTimer = setTimeout(() => { pendingBodyCaptures.delete(captureDone); }, 10 * 60 * 1000);
+  if (captureSettled) {
+    clearTimeout(fallbackTimer);
+    pendingBodyCaptures.delete(captureDone);
+  }
 }
 
-function waitForPendingBodies(timeoutMs = 10000) {
-  if (!pendingBodyCaptures.size) return Promise.resolve();
+async function waitForPendingBodies(timeoutMs = 10000) {
+  if (!pendingBodyCaptures.size) return;
 
-  const pending = Promise.allSettled([...pendingBodyCaptures]);
-  const timeout = new Promise(resolve => setTimeout(resolve, timeoutMs));
-  return Promise.race([pending, timeout]);
+  const snapshot = [...pendingBodyCaptures];
+  let timeoutId = 0;
+  const timedOut = await Promise.race([
+    Promise.allSettled(snapshot).then(() => false),
+    new Promise(resolve => {
+      timeoutId = setTimeout(() => resolve(true), timeoutMs);
+    })
+  ]);
+  clearTimeout(timeoutId);
+  // 超时后把这一批移出集合,避免 Stop 之后每次导出再白等 10s。
+  // 稍后 finish() 仍会写回 request 对象,下一次导出能拿到迟到的 body。
+  if (timedOut) {
+    for (const p of snapshot) pendingBodyCaptures.delete(p);
+  }
 }
 
 // --- HAR builder -------------------------------------------------------------
@@ -501,7 +816,7 @@ function buildEntry(r) {
   const respHeaders = parseHeaders(r.responseHeaders);
 
   const entry = {
-    startedDateTime: isoString(r.startTime),
+    startedDateTime: isoString(r.hopStartTime || r.startTime),
     time,
     request: {
       method:      r.method || "GET",
@@ -536,18 +851,37 @@ function buildEntry(r) {
       bodySize:    r.responseBodySize ?? 0
     },
     cache:   {},
-    timings: { send, wait, receive },
+    // dns/connect/blocked/ssl 拿不到时 HAR 1.2 要求填 -1,不能省略
+    timings: { blocked: -1, dns: -1, connect: -1, send, wait, receive, ssl: -1 },
     // --- 逆向上下文扩展字段(下划线前缀,HAR 消费者会忽略未知字段) ---
     _tabId:       r.tabId ?? -1,
     _frameId:     r.frameId ?? -1,
+    _parentFrameId: r.parentFrameId ?? -1,
     _originUrl:   r.originUrl || null,
     _documentUrl: r.documentUrl || null,
     _incognito:   !!r.incognito,
     _thirdParty:  !!r.thirdParty,
     _ip:          r.ip || null,
     _fromCache:   !!r.fromCache,
-    _proxyInfo:   r.proxyInfo || null
+    _proxyInfo:   r.proxyInfo || null,
+    _captureSource: r.captureSource || "webRequest"
   };
+
+  if (Array.isArray(r.frameAncestors) && r.frameAncestors.length) {
+    entry._frameAncestors = r.frameAncestors.map(f => ({
+      url: f.url || "",
+      frameId: f.frameId ?? -1
+    }));
+  }
+  if (r.callStack && r.callStack.length) entry._callStack = r.callStack;
+  if (r.initiatorType) entry._initiatorType = r.initiatorType;
+  if (typeof r.redirectIndex === "number") {
+    entry._redirectIndex = r.redirectIndex;
+    entry._redirectTotal = r.redirectTotal;
+    entry._redirectId = String(r.requestId);
+    entry._redirectChain = r.redirectChain || [];
+  }
+  if (r.transitionType) entry._transitionType = r.transitionType;
 
   if (r.requestPostData !== null && r.requestPostData !== undefined) {
     entry.request.postData = {
@@ -577,6 +911,87 @@ function buildEntry(r) {
   return entry;
 }
 
+function redirectChainSummary(r) {
+  const hops = r.redirectHops || [];
+  const chain = hops.map(h => ({
+    url: h.url,
+    method: h.method,
+    status: h.status,
+    redirectURL: h.redirectUrl || ""
+  }));
+  chain.push({
+    url: r.url,
+    method: r.method,
+    status: r.status || 0,
+    redirectURL: ""
+  });
+  return chain;
+}
+
+function buildRedirectEntries(r) {
+  const hops = r.redirectHops || [];
+  if (!hops.length) return [buildEntry(r)];
+  const total = hops.length + 1;
+  const chain = redirectChainSummary(r);
+  const out = [];
+  for (let i = 0; i < hops.length; i++) {
+    const hop = hops[i];
+    const keepBody = i === 0 && methodKeepsBody(hop.method);
+    out.push(buildEntry(Object.assign({}, r, {
+      url: hop.url,
+      method: hop.method,
+      startTime: hop.startTime,
+      hopStartTime: hop.startTime,
+      status: hop.status,
+      statusLine: hop.statusLine,
+      statusText: hop.statusText,
+      requestHeaders: hop.requestHeaders,
+      responseHeaders: hop.responseHeaders,
+      redirectUrl: hop.redirectUrl,
+      sendTime: hop.sendTime ?? 0,
+      waitTime: hop.waitTime ?? 0,
+      receiveTime: hop.receiveTime ?? 0,
+      ip: hop.ip || null,
+      fromCache: !!hop.fromCache,
+      requestPostData: keepBody ? r.requestPostData : null,
+      requestPostDataEncoding: keepBody ? r.requestPostDataEncoding : null,
+      requestPostDataParams: keepBody ? r.requestPostDataParams : null,
+      requestBodySize: keepBody ? r.requestBodySize : 0,
+      requestBodyError: keepBody ? r.requestBodyError : null,
+      requestBodyRawChunks: null,
+      responseBody: undefined,
+      responseBodySize: 0,
+      responseBodySkipped: false,
+      responseBodyTruncated: false,
+      responseBodyError: null,
+      error: null,
+      redirectIndex: i,
+      redirectTotal: total,
+      redirectChain: chain
+    })));
+  }
+  const finalKeepBody = methodKeepsBody(r.method);
+  out.push(buildEntry(Object.assign({}, r, {
+    requestBodyRawChunks: null,
+    requestPostData: finalKeepBody ? r.requestPostData : null,
+    requestPostDataEncoding: finalKeepBody ? r.requestPostDataEncoding : null,
+    requestPostDataParams: finalKeepBody ? r.requestPostDataParams : null,
+    requestBodySize: finalKeepBody ? r.requestBodySize : 0,
+    requestBodyError: finalKeepBody ? r.requestBodyError : null,
+    redirectUrl: "",
+    redirectIndex: hops.length,
+    redirectTotal: total,
+    redirectChain: chain
+  })));
+  return out;
+}
+
+function buildEntriesForRequest(r) {
+  finalizeRequestBody(r);
+  if (r.redirectHops && r.redirectHops.length) return buildRedirectEntries(r);
+  return [buildEntry(r)];
+}
+
 function buildHAR() {
   const entries = [];
   // 按 tabId 聚合成 HAR page(贴近 DevTools 导出习惯,逆向按标签页浏览)
@@ -586,8 +1001,8 @@ function buildHAR() {
     // 保留所有已发起的请求,包括失败请求(status 为 0)——它们在逆向场景
     // 中同样有诊断价值,错误原因通过 entry.response._error 暴露。
     if (!r.url) return;
-    const entry = buildEntry(r);
-    entries.push(entry);
+    const produced = buildEntriesForRequest(r);
+    for (const entry of produced) entries.push(entry);
     if (typeof r.tabId === "number" && r.tabId >= 0) {
       let info = pageInfo.get(r.tabId);
       if (!info) {
@@ -626,12 +1041,12 @@ function buildHAR() {
 
   const log = {
     version: "1.2",
-    creator: { name: "Network Logger", version: "1.2.2" },
+    creator: { name: "Network Logger", version: "1.2.11" },
     entries
   };
-  // 注意:downloadHARStream 用 JSON.stringify(log).slice(0,-1) 拼接 entries,
-  // 空数组 `"pages":[]` 会被切成 `"pages":[` 导致非法 JSON,因此只有存在
-  // page 时才输出 pages 字段。
+  // HAR 1.2 允许省略 pages。空数组没有信息量,省略即可。
+  // downloadHARStream 序列化的是去掉 entries 后的 meta,空 pages:[] 本身
+  // 不会把 JSON 切坏(slice 掉的是对象的 '}'),省略只是为了文件更干净。
   if (pages.length) log.pages = pages;
   return { log };
 }
@@ -654,24 +1069,32 @@ const SENSITIVE_HEADERS = new Set([
   "x-access-token", "x-session-id", "www-authenticate", "proxy-authenticate"
 ]);
 
+const SENSITIVE_URL_HEADERS = new Set([
+  "referer", "referrer", "location", "content-location", "refresh"
+]);
+
 const SENSITIVE_BODY_PATTERNS = [
   /["']?[Bb]earer\s+[A-Za-z0-9_\-.~+\/]+=*["']?/g,
-  /("(?:password|passwd|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|auth[_-]?token|session[_-]?id|csrf[_-]?token|xsrf[_-]?token)")\s*:\s*"[^"]*"/gi,
-  /(?:password|passwd|secret|token|api_key|access_token|refresh_token|client_secret)=[^&\s]*/gi
+  /("(?:password|passwd|secret|id[_-]?token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|auth[_-]?token|session[_-]?id|csrf[_-]?token|xsrf[_-]?token|token)")\s*:\s*"[^"]*"/gi,
+  /(?:password|passwd|secret|id_token|api_key|access_token|refresh_token|client_secret|token)=[^&\s]*/gi
 ];
 
 const SENSITIVE_QUERY_PARAMS = new Set([
-  "token", "access_token", "refresh_token", "api_key", "apikey",
-  "key", "secret", "password", "passwd", "session_id", "csrf_token", "auth"
+  "token", "access_token", "refresh_token", "id_token", "api_key", "apikey",
+  "key", "secret", "password", "passwd", "session_id", "csrf_token", "auth",
+  "client_secret"
 ]);
 
 function scrubHeaders(headers) {
   if (!headers || !Array.isArray(headers)) return headers;
-  return headers.map(h =>
-    SENSITIVE_HEADERS.has(String(h.name || "").toLowerCase())
-      ? { name: h.name, value: REDACTED }
-      : h
-  );
+  return headers.map(h => {
+    const name = String(h.name || "").toLowerCase();
+    if (SENSITIVE_HEADERS.has(name)) return { name: h.name, value: REDACTED };
+    if (SENSITIVE_URL_HEADERS.has(name) && h.value) {
+      return { name: h.name, value: scrubUrl(String(h.value)) };
+    }
+    return h;
+  });
 }
 
 function scrubCookies(cookies) {
@@ -708,6 +1131,23 @@ function scrubBodyText(text) {
   return scrubbed;
 }
 
+function scrubAmpSeparatedParams(raw) {
+  let changed = false;
+  const text = raw.split("&").map(pair => {
+    if (!pair) return pair;
+    const eq = pair.indexOf("=");
+    const rawName = eq > -1 ? pair.slice(0, eq) : pair;
+    let name = rawName;
+    try { name = decodeURIComponent(rawName); } catch { /* 保留原始 name */ }
+    if (SENSITIVE_QUERY_PARAMS.has(name.toLowerCase())) {
+      changed = true;
+      return `${rawName}=${REDACTED_URL_VALUE}`;
+    }
+    return pair;
+  }).join("&");
+  return { text, changed };
+}
+
 function scrubUrl(url) {
   if (!url) return url;
   try {
@@ -716,28 +1156,39 @@ function scrubUrl(url) {
     const rest = qIdx === -1 ? "" : url.slice(qIdx);
     const fragIdx = rest.indexOf("#");
     const queryStr = fragIdx > -1 ? rest.slice(0, fragIdx) : rest; // 含 '?'
-    const fragment = fragIdx > -1 ? rest.slice(fragIdx) : "";
+    let fragment = fragIdx > -1 ? rest.slice(fragIdx) : "";
     let changed = false;
 
     // 1) query 敏感参数脱敏。只替换参数值,保留 URL 其余部分的原始字符串
     //    形式,不会把非敏感部分的字符表示规范化改写。
-    const scrubbedQuery = queryStr
-      ? queryStr.slice(1).split("&").map(pair => {
-          if (!pair) return pair;
-          const eq = pair.indexOf("=");
-          const rawName = eq > -1 ? pair.slice(0, eq) : pair;
-          let name = rawName;
-          try { name = decodeURIComponent(rawName); } catch { /* 保留原始 name */ }
-          if (SENSITIVE_QUERY_PARAMS.has(name.toLowerCase())) {
-            changed = true;
-            // 裸参数(无 =)也补上脱敏值,与 queryString 数组解析结果保持一致
-            return `${rawName}=${REDACTED_URL_VALUE}`;
-          }
-          return pair;
-        }).join("&")
-      : "";
+    let scrubbedQuery = "";
+    if (queryStr) {
+      const result = scrubAmpSeparatedParams(queryStr.slice(1));
+      scrubbedQuery = result.text;
+      if (result.changed) changed = true;
+    }
 
-    // 2) userinfo 脱敏:scheme:// 之后、authority 结束(第一个 '/')之前的
+    // 2) fragment: OAuth implicit 的 #access_token=... 以及 hash 路由
+    //    #/path?token=... 都按同样规则擦参数,不能原样拼回去。
+    if (fragment.length > 1) {
+      const body = fragment.slice(1);
+      const fq = body.indexOf("?");
+      if (fq > -1) {
+        const result = scrubAmpSeparatedParams(body.slice(fq + 1));
+        if (result.changed) {
+          fragment = `#${body.slice(0, fq)}?${result.text}`;
+          changed = true;
+        }
+      } else if (body.includes("=")) {
+        const result = scrubAmpSeparatedParams(body);
+        if (result.changed) {
+          fragment = `#${result.text}`;
+          changed = true;
+        }
+      }
+    }
+
+    // 3) userinfo 脱敏:scheme:// 之后、authority 结束(第一个 '/')之前的
     //    '@' 前是用户名[:密码]凭据,泄露即等于明文密码。注意必须在 query
     //    分支之外独立处理 —— 无 query 的 URL(如 `https://u:p@host/path`)
     //    之前会因 `qIdx === -1` 直接返回而漏掉。
@@ -782,7 +1233,7 @@ function scrubEntry(entry) {
   entry.request.cookies = scrubCookies(entry.request.cookies);
   if (entry.request.queryString) {
     entry.request.queryString = entry.request.queryString.map(q =>
-      SENSITIVE_QUERY_PARAMS.has(q.name.toLowerCase())
+      SENSITIVE_QUERY_PARAMS.has(String(q.name || "").toLowerCase())
         ? { name: q.name, value: REDACTED_URL_VALUE }
         : q
     );
@@ -806,20 +1257,75 @@ function scrubEntry(entry) {
   if (entry.response.content && entry.response.content.text && !entry.response.content.encoding) {
     entry.response.content.text = scrubBodyText(entry.response.content.text);
   }
+  if (Array.isArray(entry._redirectChain)) {
+    entry._redirectChain = entry._redirectChain.map(h => ({
+      ...h,
+      url: scrubUrl(h.url),
+      redirectURL: h.redirectURL ? scrubUrl(h.redirectURL) : h.redirectURL
+    }));
+  }
+  if (Array.isArray(entry._frameAncestors)) {
+    entry._frameAncestors = entry._frameAncestors.map(f => ({
+      ...f,
+      url: scrubUrl(f.url)
+    }));
+  }
+  if (Array.isArray(entry._callStack)) {
+    entry._callStack = entry._callStack.map(f => ({
+      ...f,
+      url: f.url ? scrubUrl(f.url) : f.url
+    }));
+  }
   return entry;
 }
 
 // --- Firefox webRequest event handlers --------------------------------------
+function continueRedirectRequest(existing, details) {
+  // Firefox re-fires onBeforeRequest after onBeforeRedirect with the same
+  // requestId. Keep hops, body, call stack; only refresh fields for the new hop.
+  existing.url = details.url;
+  existing.method = details.method || existing.method;
+  existing.type = details.type || existing.type;
+  existing.resourceType = details.type || existing.resourceType;
+  if (details.originUrl) existing.originUrl = details.originUrl;
+  if (details.documentUrl) existing.documentUrl = details.documentUrl;
+  if (details.frameAncestors) existing.frameAncestors = details.frameAncestors;
+  if (typeof details.frameId === "number") existing.frameId = details.frameId;
+  if (typeof details.parentFrameId === "number") existing.parentFrameId = details.parentFrameId;
+  existing.thirdParty = !!details.thirdParty;
+  existing.incognito = !!details.incognito;
+  if (details.proxyInfo) existing.proxyInfo = details.proxyInfo;
+
+  // HTTP 302: the first StreamFilter usually survives and captures the final
+  // body — do not attach a second consumer. HSTS / internal upgrades kill the
+  // first channel (`Invalid request ID`); reattach on this continuation.
+  if (shouldReattachFilter(existing)) {
+    releaseStreamFilter(existing);
+    if (isDeadFilterError(existing.responseBodyError) ||
+        !(existing._countedResponseBytes > 0)) {
+      existing.responseBodyError = null;
+      existing.responseBody = undefined;
+      existing.responseBodySize = 0;
+    }
+    attachResponseFilter(details.requestId);
+  }
+}
+
 function onBeforeRequest(details) {
   if (!isRecording) return {};
+  if (isSelfUrl(details.url)) return {};
 
-  if (requests.size >= 50000) {
-    const oldestKey = requests.keys().next().value;
-    requests.delete(oldestKey);
+  const existing = requests.get(details.requestId);
+  if (existing) {
+    continueRedirectRequest(existing, details);
+    return {};
   }
 
+  ensureCapacity();
+
+  const initiator = takeInitiator(details.tabId, details.url, details.method, details.frameId);
   const body = extractRequestBody(details.requestBody);
-  requests.set(details.requestId, {
+  const rec = {
     tabId:              details.tabId,
     requestId:          details.requestId,
     url:                details.url,
@@ -848,18 +1354,30 @@ function onBeforeRequest(details) {
     receiveTime:        0,
     protocol:           null,
     redirectUrl:        "",
-    // --- 逆向上下文(details 直接提供,Firefox 均已支持) ---
-    originUrl:          details.originUrl || null,   // 触发请求的来源 URL
-    documentUrl:        details.documentUrl || null, // 请求所在文档 URL
+    originUrl:          details.originUrl || null,
+    documentUrl:        details.documentUrl || null,
     resourceType:       details.type || null,
     frameId:            details.frameId ?? -1,
+    parentFrameId:      details.parentFrameId ?? -1,
+    frameAncestors:     details.frameAncestors || null,
+    callStack:          initiator ? initiator.frames : null,
+    initiatorType:      initiator ? initiator.via : null,
+    captureSource:      "webRequest",
+    redirectHops:       [],
+    hopStartTime:       details.timeStamp,
     incognito:          !!details.incognito,
     thirdParty:         !!details.thirdParty,
     proxyInfo:          details.proxyInfo || null,
     fromCache:          false,
-    ip:                 null
-  });
-
+    ip:                 null,
+    filterAttached:     false,
+    filterGeneration:   0,
+    _countedRequestBytes: body.size || 0,
+    _countedResponseBytes: 0
+  };
+  requests.set(details.requestId, rec);
+  liveEntries += 1;
+  totalBodyBytes += rec._countedRequestBytes;
   attachResponseFilter(details.requestId);
   updateBadge();
   return {};
@@ -869,13 +1387,15 @@ function onBeforeSendHeaders(details) {
   const r = requests.get(details.requestId);
   if (!r) return;
   r.requestHeaders = details.requestHeaders || [];
+  r.method = details.method || r.method;
   // HAR 的 timings.send 定义为"发送请求"耗时:从发起请求到头部发出的时间。
-  r.sendTime = Math.max(0, details.timeStamp - r.startTime);
+  r.sendTime = Math.max(0, details.timeStamp - hopOrigin(r));
   // requestBody 捕获受限时(如 body 过大或未解析),用 content-length 兜底
   // bodySize,否则导出的 request.bodySize 会恒为 0。
   if (!r.requestBodySize) {
     const cl = getHeaderValue(details.requestHeaders, "content-length");
-    if (cl) r.requestBodySize = parseInt(cl, 10) || 0;
+    const n = parseInt(cl, 10);
+    if (Number.isFinite(n) && n >= 0) r.requestBodySize = n;
   }
   finalizeRequestBody(r);
 }
@@ -891,24 +1411,51 @@ function onHeadersReceived(details) {
   // 与 send 阶段重叠,使 HAR timings 三段(send/wait/receive)之和恰好等于
   // 请求总耗时。sendTime 恒在 onHeadersReceived 之前由 onBeforeSendHeaders
   // 写入,即使该事件缺失(值为 0)此式也退化为原来的全量等待时长。
-  r.waitTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime);
+  r.waitTime = Math.max(0, details.timeStamp - hopOrigin(r) - r.sendTime);
   // 对未捕获响应体(NON_BODY_TYPES)的请求,用 content-length 兜底记录大小;
   // 已捕获的请求会在 finalizeResponseBody 里用真实字节数覆盖此值。
   if (!r.responseBodySize) {
     const cl = getHeaderValue(details.responseHeaders, "content-length");
-    if (cl) r.responseBodySize = parseInt(cl, 10) || 0;
+    const n = parseInt(cl, 10);
+    if (Number.isFinite(n) && n >= 0) r.responseBodySize = n;
   }
 }
 
 function onBeforeRedirect(details) {
   const r = requests.get(details.requestId);
   if (!r) return;
+  const origin = hopOrigin(r);
+  const receiveTime = Math.max(0, details.timeStamp - origin - r.sendTime - r.waitTime);
+  if (!r.redirectHops) r.redirectHops = [];
+  r.redirectHops.push({
+    url: details.url,
+    method: r.method,
+    status: details.statusCode || r.status,
+    statusLine: details.statusLine || r.statusLine,
+    statusText: statusTextFromLine(details.statusLine, details.statusCode) || r.statusText,
+    redirectUrl: details.redirectUrl || "",
+    requestHeaders: cloneHeaders(r.requestHeaders),
+    responseHeaders: cloneHeaders(details.responseHeaders),
+    sendTime: r.sendTime,
+    waitTime: r.waitTime,
+    receiveTime,
+    startTime: origin,
+    timeStamp: details.timeStamp,
+    ip: details.ip || r.ip,
+    fromCache: !!details.fromCache
+  });
+  liveEntries += 1;
+  ensureCapacity(details.requestId);
+  r.url = details.redirectUrl || r.url;
+  r.redirectUrl = details.redirectUrl || "";
   r.status = details.statusCode || r.status;
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
   r.responseHeaders = details.responseHeaders || r.responseHeaders;
-  r.redirectUrl = details.redirectUrl || "";
-  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
+  r.hopStartTime = details.timeStamp;
+  r.sendTime = 0;
+  r.waitTime = 0;
+  r.receiveTime = 0;
 }
 
 function onCompleted(details) {
@@ -917,7 +1464,7 @@ function onCompleted(details) {
   r.status = details.statusCode || r.status;
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
-  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
+  r.receiveTime = Math.max(0, details.timeStamp - hopOrigin(r) - r.sendTime - r.waitTime);
   // 连接信息:服务器 IP 与是否命中缓存(判断"这请求是否真的走了网络")
   r.ip = details.ip || r.ip;
   r.fromCache = !!details.fromCache;
@@ -927,7 +1474,7 @@ function onErrorOccurred(details) {
   const r = requests.get(details.requestId);
   if (!r) return;
   r.error = details.error || "Request failed";
-  r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
+  r.receiveTime = Math.max(0, details.timeStamp - hopOrigin(r) - r.sendTime - r.waitTime);
   // 失败请求也能拿到目标 IP(DNS/连接阶段失败时可能为空)
   r.ip = details.ip || r.ip;
 }
@@ -940,13 +1487,133 @@ api.webRequest.onBeforeRedirect.addListener(onBeforeRedirect, allUrls, ["respons
 api.webRequest.onCompleted.addListener(onCompleted, allUrls);
 api.webRequest.onErrorOccurred.addListener(onErrorOccurred, allUrls);
 
+function mergeRestrictedNav(existing, details, extra) {
+  if (extra.error) {
+    existing.error = extra.error;
+    existing.initiatorType = "navigation-error";
+    existing.responseBodyError = extra.error;
+  }
+  if (details.transitionType) existing.transitionType = details.transitionType;
+}
+
+function recordRestrictedNav(details, extra) {
+  if (!isRecording || !FEATURES.restrictedNav) return;
+  if (!isRestrictedUrl(details.url) || isSelfUrl(details.url)) return;
+  extra = extra || {};
+  const group = `nav:${details.tabId}:${details.frameId}:${details.url}`;
+  const lastId = navLatest.get(group);
+  const last = lastId ? requests.get(lastId) : null;
+  if (last && Math.abs((last.startTime || 0) - (details.timeStamp || 0)) <= 2000) {
+    mergeRestrictedNav(last, details, extra);
+    return;
+  }
+  const id = last ? `${group}:${details.timeStamp}` : group;
+  navLatest.set(group, id);
+  ensureCapacity();
+  requests.set(id, {
+    tabId: details.tabId,
+    requestId: id,
+    url: details.url,
+    method: "GET",
+    type: details.frameId === 0 ? "main_frame" : "sub_frame",
+    requestHeaders: [],
+    requestPostData: null,
+    requestPostDataEncoding: null,
+    requestPostDataParams: null,
+    requestBodySize: 0,
+    requestBodyError: null,
+    requestBodyRawChunks: null,
+    requestBodyRawTotalBytes: 0,
+    startTime: details.timeStamp,
+    hopStartTime: details.timeStamp,
+    status: extra.status || 0,
+    statusText: extra.statusText || "",
+    statusLine: "",
+    responseHeaders: [],
+    responseBodySize: 0,
+    responseBody: undefined,
+    responseBodyEncoded: false,
+    responseBodyError: extra.error || null,
+    responseBodyTruncated: false,
+    responseBodySkipped: true,
+    sendTime: 0,
+    waitTime: 0,
+    receiveTime: 0,
+    protocol: null,
+    redirectUrl: "",
+    originUrl: details.originUrl || null,
+    documentUrl: details.url,
+    resourceType: details.frameId === 0 ? "main_frame" : "sub_frame",
+    frameId: details.frameId ?? -1,
+    parentFrameId: details.parentFrameId ?? -1,
+    frameAncestors: null,
+    callStack: null,
+    initiatorType: extra.error ? "navigation-error" : "navigation",
+    captureSource: "webNavigation",
+    redirectHops: [],
+    incognito: !!details.incognito,
+    thirdParty: false,
+    proxyInfo: null,
+    fromCache: false,
+    ip: null,
+    error: extra.error || null,
+    transitionType: details.transitionType || null
+  });
+  liveEntries += 1;
+  updateBadge();
+}
+
+if (api.webNavigation && api.webNavigation.onCommitted) {
+  api.webNavigation.onCommitted.addListener(details => {
+    recordRestrictedNav(details, {});
+  });
+}
+if (api.webNavigation && api.webNavigation.onErrorOccurred) {
+  api.webNavigation.onErrorOccurred.addListener(details => {
+    recordRestrictedNav(details, { error: details.error || "Navigation failed" });
+  });
+}
+
+if (api.tabs && api.tabs.onRemoved) {
+  api.tabs.onRemoved.addListener(tabId => {
+    initiatorQueues.delete(tabId);
+    const prefix = `nav:${tabId}:`;
+    for (const key of [...navLatest.keys()]) {
+      if (key.startsWith(prefix)) navLatest.delete(key);
+    }
+  });
+}
+
+function broadcastRecording(value) {
+  if (!api.tabs || typeof api.tabs.query !== "function" || typeof api.tabs.sendMessage !== "function") return;
+  const msg = { action: "nlSetRecording", recording: !!value };
+  ignoreResult(api.tabs.query({}).then(tabs => {
+    (tabs || []).forEach(tab => {
+      if (typeof tab.id !== "number") return;
+      const send = frameId => {
+        const p = typeof frameId === "number"
+          ? api.tabs.sendMessage(tab.id, msg, { frameId })
+          : api.tabs.sendMessage(tab.id, msg);
+        if (p && typeof p.catch === "function") p.catch(() => {});
+      };
+      if (api.webNavigation && typeof api.webNavigation.getAllFrames === "function") {
+        ignoreResult(api.webNavigation.getAllFrames({ tabId: tab.id }).then(frames => {
+          if (!frames || !frames.length) send();
+          else frames.forEach(frame => send(frame.frameId));
+        }).catch(() => send()));
+      } else {
+        send();
+      }
+    });
+  }));
+}
+
 // --- Download ----------------------------------------------------------------
-// Streams the HAR out as a list of Blob parts instead of a single giant
-// JSON string. The log header is serialized once; each entry is serialized
-// on its own and appended to the parts array. Firefox may page large Blob
-// data to a temporary file, so peak memory during export is roughly one
-// entry's JSON plus the assembled Blob handle, instead of N full copies
-// (object graph + giant string + Blob) of the whole capture.
+// Serialize each entry separately and join as Blob parts so we never
+// allocate one contiguous JSON.stringify of the entire HAR. Peak memory is
+// still the object graph plus every entry JSON string in `parts` (and the
+// Blob) — the win is avoiding a second giant string from stringify(wholeLog),
+// and letting the engine keep many smaller ropes instead of one allocation.
 async function downloadHARStream(har, filename) {
   const parts = [];
 
@@ -1083,60 +1750,105 @@ async function downloadHARStream(har, filename) {
 }
 
 // --- Message handler ---------------------------------------------------------
-function isTrustedExtensionSender(sender) {
-  return sender && sender.id === api.runtime.id && !sender.tab;
-}
-
 async function handleMessage(message, sender) {
-  if (!isTrustedExtensionSender(sender)) {
+  if (!sender || sender.id !== api.runtime.id) {
+    return { success: false, error: "Unauthorized sender" };
+  }
+  if (!message || typeof message !== "object") {
+    return { success: false, error: "Invalid message" };
+  }
+
+  // Content scripts may report call stacks; they must not start/stop/export.
+  if (message.action === "initiatorStack") {
+    if (!isRecording || !FEATURES.callStack) return { success: true };
+    const tabId = sender.tab && typeof sender.tab.id === "number" ? sender.tab.id : -1;
+    rememberInitiator(tabId, {
+      url: String(message.url || ""),
+      method: String(message.method || "GET").toUpperCase(),
+      frames: parseStack(String(message.stack || "").slice(0, 16384)),
+      via: message.via || "script",
+      frameId: typeof sender.frameId === "number" ? sender.frameId : 0,
+      t: Date.now()
+    });
+    return { success: true };
+  }
+
+  const senderUrl = sender.url || (sender.tab && sender.tab.url) || "";
+  const fromExtensionPage = isSelfUrl(senderUrl);
+
+  // Content scripts need a fast in-memory recording flag at document_start.
+  // Extension pages (toolbar popup or popup.html opened as a tab) use the
+  // full getStatus payload below, including incognitoAllowed.
+  if (message.action === "getStatus" && sender.tab && !fromExtensionPage) {
+    return { isRecording, count: recordedCount(), startTime: recordingStartTime };
+  }
+
+  if (sender.tab && !fromExtensionPage) {
     return { success: false, error: "Unauthorized sender" };
   }
 
   switch (message.action) {
     case "getStatus":
-      return { isRecording, count: requests.size, startTime: recordingStartTime };
+      return {
+        isRecording,
+        count: recordedCount(),
+        startTime: recordingStartTime,
+        incognitoAllowed: await getIncognitoAllowed()
+      };
 
     case "getFeatures":
       return { features: FEATURES };
 
     case "startRecording":
       if (!isRecording) {
-        requests.clear();
-        // 上一会话若因响应流卡住走了 waitForPendingBodies 的 10s 超时,
-        // pendingBodyCaptures 可能残留旧 promise;不清理会让本次会话导出时
-        // 继续为已丢弃的旧响应白等。旧捕获的 finish() 仍会执行,但已不在
-        // 集合中,delete/resolve 均为无害空操作。
-        pendingBodyCaptures.clear();
+        const startTime = Date.now();
+        resetCaptureState();
+        // 先打开内存开关,让 getStatus / initiatorStack 立刻生效,再写 storage、
+        // 再广播已打开页面去注入 hook,避免 content 先上报却被 !isRecording 丢掉。
         isRecording = true;
-        recordingStartTime = Date.now();
-        updateBadge();
-        await api.storage.local.set({ isRecording: true, startTime: recordingStartTime });
+        recordingStartTime = startTime;
+        updateBadge(true);
+        try {
+          await api.storage.local.set({ isRecording: true, startTime });
+        } catch {
+          // 内存已在录;持久化失败时重启不会自动恢复,但本次会话仍可用
+        }
+        broadcastRecording(true);
       }
       return { success: true, isRecording: true };
 
     case "stopRecording":
       if (isRecording) {
         isRecording = false;
+        broadcastRecording(false);
         await waitForPendingBodies();
-        await api.storage.local.set({ isRecording: false });
-        updateBadge();
+        try {
+          await api.storage.local.set({ isRecording: false });
+        } catch {
+          // 内存侧已停止;持久化失败时 popup 仍应看到成功,避免 UI 以为还在录
+        }
+        updateBadge(true);
       }
-      return { success: true, isRecording: false, count: requests.size };
+      return { success: true, isRecording: false, count: recordedCount() };
 
     case "clearRecording":
-      requests.clear();
-      pendingBodyCaptures.clear();
+      resetCaptureState();
       isRecording = false;
       recordingStartTime = null;
-      await api.storage.local.set({ isRecording: false });
-      updateBadge();
+      broadcastRecording(false);
+      try {
+        await api.storage.local.set({ isRecording: false });
+      } catch {
+        // same as stop: in-memory clear already took effect
+      }
+      updateBadge(true);
       return { success: true };
 
     case "getCount":
-      return { count: requests.size };
+      return { count: recordedCount() };
 
     case "exportHAR":
-      return { har: await buildHARAfterBodyFlush() };
+      return { success: false, error: "Use downloadHAR" };
 
     case "downloadHAR": {
       const har = await buildHARAfterBodyFlush();
@@ -1171,11 +1883,12 @@ api.runtime.onMessage.addListener((message, sender) =>
 
 // --- Restore state after background reload ----------------------------------
 api.storage.local.get(["isRecording", "startTime"]).then(result => {
-  if (result.isRecording) {
+  if (result && result.isRecording) {
     isRecording = true;
     recordingStartTime = result.startTime || Date.now();
-    updateBadge();
-  } else if (actionApi) {
-    ignoreResult(actionApi.setBadgeText({ text: "" }));
+    updateBadge(true);
+    broadcastRecording(true);
+  } else {
+    updateBadge(true);
   }
 });

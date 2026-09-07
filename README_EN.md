@@ -74,12 +74,13 @@ The current version passes Firefox extension validation:
 ## Known Limitations
 
 - Requests sent before recording starts are not captured
-- Firefox internal pages, extension pages, and some browser-reserved pages cannot be captured
-- Requests in private windows depend on whether Firefox allows this extension to run in private windows
-- Single response bodies over 50MB or request bodies over 8MB are truncated (the response still streams to the page normally); exports mark this via `_bodyTruncated` / `postData._error`
-- Redirect chains record only the initial URL and the final status (the webRequest API does not expose per-hop information)
+- Single response bodies over 50MB or request bodies over 8MB are truncated (the response still streams to the page normally); exports mark this via `_bodyTruncated` / `postData._error`. A session is also capped at 50,000 entries (including redirect hops) and about 400MB of captured bodies; the oldest requests are evicted first
+- Redirect chains are expanded into one HAR entry per hop (`_redirectChain` / `_redirectIndex`), keeping intermediate Set-Cookie and Location values. Firefox re-fires `onBeforeRequest` with the same `requestId` after a redirect; continuation hops update URL/method only and do not replace hops/body/call stack. A normal 302 keeps the first `filterResponseData`; HSTS/internal upgrades invalidate that channel (`Invalid request ID`), so the continuation disconnects the dead filter and reattaches to keep the final HTML body
+- Page JS call stacks are attached for fetch/XHR/beacon/WebSocket handshakes (`_callStack` / `_initiatorType`); parser-driven script/img loads, service-worker / Worker-internal requests, and `EventSource` have no JS stack. `page-hook.js` is not fetched unless recording. A weaker isolated-world fallback is installed only while recording is unknown or on, and is removed once getStatus/storage confirm idle (if the page already replaced `fetch`, it is left alone). Start and background restore broadcast an inject into already-open pages. If CSP blocks the script, the weaker fallback remains (`fetch(new URL(...))` is resolved). The control token is delivered with a synchronous CustomEvent; pages cannot bind or disable the hook with a token-less `postMessage`
+- Restricted schemes (`about:`, `moz-extension:`) cannot expose HTTP bodies via webRequest; they are recorded as navigation entries via webNavigation (`_captureSource: webNavigation`). `about:blank` is skipped as noise. committed/error for the same restricted URL within ~2s are merged; later revisits are kept as separate entries
+- Private windows require enabling the add-on in about:addons; the popup warns when access is not granted
 - Failed requests are kept with `status: 0`; the failure reason is recorded in the `response._error` extension field
-- Response bodies of image/media resources are not cached (fonts are kept for font reverse engineering); their `content.size` is taken from content-length (possibly the compressed size)
+- Response bodies of image, imageset (srcset), and media resources are not cached (fonts are kept for font reverse engineering); their `content.size` is taken from content-length (possibly the compressed size)
 
 ## Exported Field Notes
 
@@ -87,11 +88,14 @@ To help with reverse engineering, the exported HAR carries these extra fields be
 
 - `request._resourceType` — resource type (image/script/xhr/font/websocket, etc.)
 - Entry-level `_originUrl` / `_documentUrl` — the initiating URL and the document URL of the request
-- Entry-level `_tabId` / `_frameId` / `_incognito` / `_thirdParty` — request ownership context
+- Entry-level `_tabId` / `_frameId` / `_parentFrameId` / `_incognito` / `_thirdParty` — request ownership context
+- Entry-level `_callStack` / `_initiatorType` / `_frameAncestors` — page call stack, initiator kind, iframe ancestors
+- Entry-level `_redirectChain` / `_redirectIndex` / `_redirectId` — per-hop redirect info
+- Entry-level `_captureSource` — `webRequest` or `webNavigation` (restricted-scheme navigations)
 - Entry-level `_ip` / `_fromCache` / `_proxyInfo` — server IP, cache hit, proxy info
 - `response._error` — failure reason for failed requests (e.g. DNS resolution failed, connection refused)
 - `response.content._decodedFrom` — original transfer encoding (gzip/br); `content.text` is the decompressed content
-- `response.content._bodySkipped` — response bodies of image/media were skipped by policy
+- `response.content._bodySkipped` — response bodies of image/imageset/media were skipped by policy
 - `response.content._bodyTruncated` — response body exceeded the retention cap; `content.text` is the truncated portion
 - `request.postData._error` — reason when the request body capture was limited or truncated
 

@@ -104,6 +104,12 @@ function setInfo(text, type = "") {
   }
 }
 
+function applyIncognitoNotice(allowed) {
+  const el = document.getElementById("incognito-notice");
+  if (!el) return;
+  el.style.display = allowed === false ? "" : "none";
+}
+
 function updateUI(recording, count = 0) {
   isRecording = recording;
   const statsBar = document.querySelector(".stats-bar");
@@ -281,6 +287,7 @@ btnClear.addEventListener("click", async () => {
 (async () => {
   try {
     const status = await sendMsg("getStatus");
+    applyIncognitoNotice(status.incognitoAllowed);
     updateUI(status.isRecording, status.count || 0);
     if (status.isRecording && status.startTime) {
       startTimer(status.startTime);

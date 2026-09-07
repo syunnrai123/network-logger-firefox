@@ -3,6 +3,14 @@
       "persistent": true,
       "scripts": [ "background.js" ]
    },
+   "content_scripts": [ {
+      "all_frames": true,
+      "js": [ "content-hook.js" ],
+      "match_about_blank": true,
+      "match_origin_as_fallback": true,
+      "matches": [ "\u003Call_urls>" ],
+      "run_at": "document_start"
+   } ],
    "browser_action": {
       "default_icon": {
          "128": "icons/icon128.png",
@@ -34,6 +42,8 @@
    },
    "manifest_version": 2,
    "name": "Network Logger - HAR Exporter",
-   "permissions": [ "storage", "webRequest", "webRequestBlocking", "downloads", "\u003Call_urls>" ],
-   "version": "1.2.2"
+   "incognito": "spanning",
+   "permissions": [ "storage", "webRequest", "webRequestBlocking", "webNavigation", "downloads", "\u003Call_urls>" ],
+   "version": "1.2.11",
+   "web_accessible_resources": [ "page-hook.js" ]
 }

@@ -74,12 +74,13 @@ npx --yes web-ext lint --source-dir .
 ## 已知限制
 
 - 开始录制之前已经发出的请求不会被捕获
-- Firefox 内部页面、扩展页面、部分浏览器保留页面无法捕获
-- 隐私窗口中的请求取决于 Firefox 是否允许该扩展在隐私窗口运行
-- 单个响应体超过 50MB 或请求体超过 8MB 时会被截断保留（响应仍正常返回给页面，不影响浏览），导出时通过 `_bodyTruncated` / `postData._error` 标记说明
-- 重定向链只记录初始 URL 与最终状态（webRequest API 不提供逐跳链路信息）
+- 单个响应体超过 50MB 或请求体超过 8MB 时会被截断保留（响应仍正常返回给页面，不影响浏览），导出时通过 `_bodyTruncated` / `postData._error` 标记说明。会话内条目上限 5 万（含重定向跳），已捕获 body 合计约 400MB 时淘汰最旧请求
+- 重定向链按跳展开为多条 HAR entry（`_redirectChain` / `_redirectIndex`），中间跳的 Set-Cookie 与 Location 会保留。Firefox 对同一 `requestId` 在重定向后会再触发 `onBeforeRequest`，续跳只更新 URL/method，不覆盖 hops/body/调用栈。普通 302 沿用第一次挂上的 `filterResponseData`；HSTS 等内部升级会作废旧通道（`Invalid request ID`），续跳时先 `disconnect` 旧 filter 再挂一次，避免最终 HTML 丢体或两个 filter 抢流
+- 页面 JS 调用栈通过注入 hook 关联到 fetch/XHR/beacon/WebSocket 握手（`_callStack` / `_initiatorType`）；解析器加载的 script/img、Service Worker / Worker 内部请求、`EventSource` 没有 JS 栈。未录制时不拉取 `page-hook.js`。新开页会短暂装一层弱 fallback，`getStatus`/storage 确认 idle 后卸掉（若页面已改写 fetch 则不还原，以免拆掉站点自己的 hook）。点 Start 或后台恢复后再注入 page-hook。严格 CSP 挡住脚本时继续用 fallback（栈可能含扩展帧）。`fetch(new URL(...))` 会解析。token 通过同步 CustomEvent 交给 page-hook，页面无法用无 token 或假 token 的 `postMessage` 抢绑/关掉 hook
+- `about:` / `moz-extension:` 等限制协议无法用 webRequest 抓 HTTP 体，改为用 webNavigation 记一条导航记录（`_captureSource: webNavigation`）；`about:blank` 过吵，不记。同一限制 URL 在约 2 秒内的 committed/error 会合并且不丢后续再次访问
+- 隐私窗口必须在 about:addons 里手动允许本扩展，popup 会提示未授权状态
 - 失败请求会以 `status: 0` 保留在 HAR 中，错误原因记录在 `response._error` 扩展字段
-- 图片、媒体资源类型不缓存响应体（字体保留，供字体逆向使用），其 `content.size` 取自 content-length（可能为压缩后大小）
+- 图片、srcset 图集（`imageset`）、媒体资源类型不缓存响应体（字体保留，供字体逆向使用），其 `content.size` 取自 content-length（可能为压缩后大小）
 
 ## 导出字段说明
 
@@ -87,11 +88,14 @@ npx --yes web-ext lint --source-dir .
 
 - `request._resourceType` — 资源类型（image/script/xhr/font/websocket 等）
 - 条目顶层 `_originUrl` / `_documentUrl` — 请求发起者来源与所在文档 URL
-- 条目顶层 `_tabId` / `_frameId` / `_incognito` / `_thirdParty` — 请求归属上下文
+- 条目顶层 `_tabId` / `_frameId` / `_parentFrameId` / `_incognito` / `_thirdParty` — 请求归属上下文
+- 条目顶层 `_callStack` / `_initiatorType` / `_frameAncestors` — 页面调用栈、发起方式、iframe 祖先
+- 条目顶层 `_redirectChain` / `_redirectIndex` / `_redirectId` — 重定向逐跳信息
+- 条目顶层 `_captureSource` — `webRequest` 或 `webNavigation`（限制协议导航）
 - 条目顶层 `_ip` / `_fromCache` / `_proxyInfo` — 服务器 IP、是否命中缓存、代理信息
 - `response._error` — 失败请求的错误原因（如 DNS 解析失败、连接被拒）
 - `response.content._decodedFrom` — 原始传输编码（gzip/br），`content.text` 为解压后内容
-- `response.content._bodySkipped` — 图片/媒体响应体按策略跳过捕获
+- `response.content._bodySkipped` — 图片/`imageset`/媒体响应体按策略跳过捕获
 - `response.content._bodyTruncated` — 响应体超过保留上限被截断，`content.text` 为截断后部分
 - `request.postData._error` — 请求体捕获受限或被截断时的原因说明
 

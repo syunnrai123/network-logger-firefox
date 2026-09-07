@@ -1,36 +1,64 @@
 # ===== JetBrains / PyCharm =====
-# 忽略 .idea 下所有本地个性化文件,仅保留 .gitignore 与 inspectionProfiles
+# 忽略 .idea 下本地个性化文件,仅保留共享的 .gitignore 与 inspectionProfiles
 .idea/*
 !.idea/.gitignore
 !.idea/inspectionProfiles/
 !.idea/inspectionProfiles/*
+*.iml
 
-# ===== Python =====
+# ===== 编辑器 =====
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+*.bak
+
+# ===== 系统文件 =====
+.DS_Store
+.AppleDouble
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ===== Node / web-ext =====
+node_modules/
+web-ext-artifacts/
+.web-extension-id
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== Python（本地脚本 / PyCharm 解释器） =====
 __pycache__/
 *.py[cod]
 *$py.class
 *.egg-info/
 .venv/
 venv/
-env/
 .eggs/
+
+# ===== 构建与运行时输出 =====
+# web-ext / 手动打包产物、导出的 HAR,不入库
 build/
 dist/
-
-# ===== 依赖 / 构建产物 =====
-node_modules/
-*.log
-
-# ===== 运行时输出 =====
-# 导出的 HAR 抓包文件与打包产物,不入库
 *.har
 *.zip
+*.xpi
+*.log
+*.tmp
+*.temp
 
-# ===== 系统文件 =====
-.DS_Store
-Thumbs.db
-Desktop.ini
+# ===== 密钥与本地配置 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
 
-# ===== 编辑器 =====
-.vscode/
-*.swp
+# ===== 本地会话 / 临时转储 =====
+/0903_firefox
