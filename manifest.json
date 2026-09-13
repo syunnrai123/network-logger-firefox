@@ -35,5 +35,5 @@
    "manifest_version": 2,
    "name": "Network Logger - HAR Exporter",
    "permissions": [ "storage", "webRequest", "webRequestBlocking", "downloads", "\u003Call_urls>" ],
-   "version": "1.2.3"
+   "version": "1.3.0"
 }
