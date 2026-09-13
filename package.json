@@ -1,0 +1,14 @@
+{
+  "name": "network-logger-firefox",
+  "version": "1.2.3",
+  "private": true,
+  "description": "Firefox extension that captures network requests across all tabs and exports them as HAR 1.2 files.",
+  "scripts": {
+    "test": "node --test test/",
+    "lint": "npx --yes web-ext lint --source-dir .",
+    "start": "npx --yes web-ext run --source-dir ."
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

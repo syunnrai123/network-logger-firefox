@@ -18,6 +18,16 @@ const requests = new Map();          // webRequest requestId -> request data
 const pendingBodyCaptures = new Set();
 let isRecording = false;
 let recordingStartTime = null;
+// 超过保留上限被淘汰的请求数(见 onBeforeRequest)。导出时写进
+// log._droppedEntries —— 一份"看起来完整但少了请求"的 HAR 对逆向最危险。
+let droppedEntryCount = 0;
+// 后台脚本重载(扩展更新 / 浏览器重启)后从 storage 恢复的录制会话:重启前
+// 抓到的数据已随内存丢失,popup 需要据此提示用户而不是显示"REC + 0 请求"。
+let resumedFromStorage = false;
+
+// requests map 的条数上限。超限时淘汰最早插入的一条,并把淘汰次数计入
+// droppedEntryCount。
+const MAX_TRACKED_REQUESTS = 50000;
 
 // --- Feature Flags -----------------------------------------------------------
 const FEATURES = {
@@ -48,9 +58,7 @@ function badgeText(count) {
   return count < 100000 ? `${Math.min(99, Math.round(count / 1000))}k` : "99k+";
 }
 
-function updateBadge() {
-  if (!FEATURES.badge || !actionApi) return;
-
+function renderBadge() {
   if (isRecording) {
     const text = requests.size > 0 ? badgeText(requests.size) : "*";
     ignoreResult(actionApi.setBadgeText({ text }));
@@ -61,6 +69,24 @@ function updateBadge() {
   } else {
     ignoreResult(actionApi.setBadgeText({ text: "" }));
   }
+}
+
+// badge 刷新节流:onBeforeRequest 每个请求都会调一次 updateBadge(),录制上万
+// 请求就是上万次跨进程 setBadgeText。200ms 窗口内首次立即生效、后续调用合并
+// 成一次,窗口末尾再补一次保证最终计数准确 —— 纯 debounce 在持续流量下永远
+// 等不到静默期,徽章会长期停在旧值。
+const BADGE_THROTTLE_MS = 200;
+let badgeTimer = null;
+let badgePending = false;
+
+function updateBadge() {
+  if (!FEATURES.badge || !actionApi) return;
+  if (badgeTimer) { badgePending = true; return; }
+  renderBadge();
+  badgeTimer = setTimeout(() => {
+    badgeTimer = null;
+    if (badgePending) { badgePending = false; updateBadge(); }
+  }, BADGE_THROTTLE_MS);
 }
 
 // --- Utilities ---------------------------------------------------------------
@@ -219,53 +245,52 @@ function bytesToBase64(bytes) {
   return btoa(parts.join(""));
 }
 
-function canDecodeUtf8(bytes) {
+// 严格 UTF-8 解码:字节合法就返回解码结果,否则返回 null。旧实现先
+// canDecodeUtf8() 探测(fatal:true)再用 fatal:false 解码一次,对同一份字节
+// 做两遍完整遍历并多分配一份中间字符串。严格解码对合法输入与非严格解码
+// 逐字符相同,直接复用结果即可省掉这一遍。
+function tryDecodeUtf8(bytes) {
   try {
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return true;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    return false;
+    return null;
   }
 }
 
-// 超过此阈值一律不做文本解码,直接 base64:
-// 1) 随机二进制字节可能恰好整体是合法 UTF-8,误判为文本会让二进制不可还原;
-// 2) 省去对大字节数组的 UTF-8 探测与解码,降低 onstop 阶段的同步阻塞;
-// 3) 大文本(如 50MB 的 text/plain)走文本解码时峰值内存约为源字节数的 4 倍
-//    (fatal 探测 + 解码 + 替换符扫描 + 结果字符串),对录制内存压力很大。
-//    逆向常用的 JSON/HTML/JS 响应体远小于该阈值,仍走文本路径保证可读性。
-const MAX_DECODE_BODY_BYTES = 1024 * 1024;
+// 解码阈值按 MIME 分级:
+// - 明确是文本的类型给 16MB 上限。逆向最常看的压缩后 JS bundle、source map、
+//   大 JSON 普遍在 1-5MB,如果统一退化成 base64,导出结果正好在首要用途上
+//   不可读 —— 而 isTextContentType 的判断这时完全帮不上忙。
+// - 未知类型维持 1MB 低阈值:随机二进制字节可能恰好整体是合法 UTF-8,误判为
+//   文本会让二进制不可还原,同时也省去对大字节数组的 UTF-8 探测与解码,降低
+//   onstop 阶段的同步阻塞。
+// 超过各自上限一律直接 base64,不做任何探测。
+const MAX_DECODE_TEXT_BYTES = 16 * 1024 * 1024;
+const MAX_DECODE_OTHER_BYTES = 1024 * 1024;
 
 function bytesToHarBody(bytes, headers) {
   const mimeType = getContentType(headers);
-  if (bytes.byteLength > MAX_DECODE_BODY_BYTES) {
+  const isText = isTextContentType(mimeType);
+  if (bytes.byteLength > (isText ? MAX_DECODE_TEXT_BYTES : MAX_DECODE_OTHER_BYTES)) {
     return { text: bytesToBase64(bytes), encoded: true };
   }
-  const isUtf8 = canDecodeUtf8(bytes);
-  const shouldDecode = isTextContentType(mimeType) || isUtf8;
 
-  if (shouldDecode) {
-    // 优先按 UTF-8 解码:现代站点普遍输出 UTF-8。仅当字节不是合法 UTF-8
-    // (canDecodeUtf8 为 false,如 GBK/Shift_JIS 编码的中文)时才信任声明的
-    // charset。这样 iso-8859-1 / windows-1252 等单字节编码的声明不会把合法
-    // UTF-8 的中文静默解成乱码 —— 这类编码解码永不出 U+FFFD 替换符,
-    // 旧的 `includes("�")` 回退条件对它们完全失效。
-    let text;
-    if (isUtf8) {
-      text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-    } else {
-      try {
-        text = new TextDecoder(getCharset(headers), { fatal: false }).decode(bytes);
-      } catch {
-        text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-      }
-      // 字节非合法 UTF-8 时按声明编码解码;若声明也不对,utf-8(fatal:false)
-      // 输出替换符,保证 HAR 的 text 至少是合法字符串,不抛异常。
-    }
-    return { text, encoded: false };
+  // 优先按 UTF-8 解码:现代站点普遍输出 UTF-8。仅当字节不是合法 UTF-8
+  // (如 GBK/Shift_JIS 编码的中文)时才信任声明的 charset。这样 iso-8859-1 /
+  // windows-1252 等单字节编码的声明不会把合法 UTF-8 的中文静默解成乱码 ——
+  // 这类编码解码永不出 U+FFFD 替换符,旧的 `includes("�")` 回退条件对它们
+  // 完全失效。
+  const utf8Text = tryDecodeUtf8(bytes);
+  if (utf8Text !== null) return { text: utf8Text, encoded: false };
+  if (!isText) return { text: bytesToBase64(bytes), encoded: true };
+
+  try {
+    return { text: new TextDecoder(getCharset(headers), { fatal: false }).decode(bytes), encoded: false };
+  } catch {
+    // 声明的 charset 不被 TextDecoder 识别:用非严格 UTF-8 兜底,保证 HAR 的
+    // text 至少是合法字符串,不抛异常(代价是出现 U+FFFD 替换符)。
+    return { text: new TextDecoder("utf-8", { fatal: false }).decode(bytes), encoded: false };
   }
-
-  return { text: bytesToBase64(bytes), encoded: true };
 }
 
 function sanitizeFilename(name) {
@@ -275,13 +300,19 @@ function sanitizeFilename(name) {
     .replace(/[\x00-\x1f]/g, "")
     .replace(/[<>:"/\\|?*]/g, "_")
     .trim();
+  // Windows 会剥掉文件名末尾的点与空格,必须在保留设备名判断之前去掉:
+  // "con." 不满足 /^(con)(\.[^.]+)?$/("." 后面没有字符),原顺序下它会躲过
+  // 前缀保护、随后被剥成 "con",加上 .har 就成了 Windows 保留设备名
+  // CON.har,downloads.download 直接报错导致导出失败。同理 "con.txt." →
+  // "con.txt" → "con.txt.har" 也不合法。
+  cleaned = cleaned.replace(/[. ]+$/, "");
   if (!cleaned) cleaned = "network-log";
   // Windows 保留设备名(CON/PRN/AUX/NUL/COM1-9/LPT1-9),带任意扩展名也不合法
   if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.[^.]+)?$/i.test(cleaned)) cleaned = "_" + cleaned;
   // 文件名组件上限 ~255 字符(含 .har 扩展名),截断避免超长自定义名导致
   // downloads.download 直接报错而导出失败
   cleaned = cleaned.slice(0, 128);
-  // Windows 会剥掉文件名末尾的点与空格,直接去掉避免"实际名与预期名不符"
+  // 截断可能重新制造出末尾点/空格(第 128 位正好是 '.'),再剥一次
   cleaned = cleaned.replace(/[. ]+$/, "");
   if (!cleaned) cleaned = "network-log";
   return cleaned;
@@ -327,13 +358,19 @@ function extractRequestBody(requestBody) {
       }
     }
 
+    if (fileParts.length) {
+      // part.file 表示该段的文件内容没有出现在 raw 里(Firefox 不暴露上传文件
+      // 字节),multipart 流中会留下一段空洞。即使同时存在内联字段也要标注,
+      // 否则 HAR 看起来像一份完整的请求体。
+      const note = `File part content not captured: ${fileParts.join(", ")}`;
+      result.error = result.error ? `${result.error}; ${note}` : note;
+    }
+
     if (chunks.length) {
       result.rawChunks = chunks;
       result.rawTotalBytes = totalBytes;
       result.size = totalBytes;
-    }
-
-    if (fileParts.length && !chunks.length) {
+    } else if (fileParts.length) {
       result.text = fileParts.join("\n");
       result.size = byteLength(result.text);
     }
@@ -484,8 +521,11 @@ function waitForPendingBodies(timeoutMs = 10000) {
   if (!pendingBodyCaptures.size) return Promise.resolve();
 
   const pending = Promise.allSettled([...pendingBodyCaptures]);
-  const timeout = new Promise(resolve => setTimeout(resolve, timeoutMs));
-  return Promise.race([pending, timeout]);
+  let timeoutTimer;
+  const timeout = new Promise(resolve => { timeoutTimer = setTimeout(resolve, timeoutMs); });
+  // 正常路径下 pending 先 settle,超时定时器无人回收,每次调用都会留下一个
+  // 仍在计时的句柄;用 finally 保证两条分支都清掉。
+  return Promise.race([pending, timeout]).finally(() => clearTimeout(timeoutTimer));
 }
 
 // --- HAR builder -------------------------------------------------------------
@@ -499,6 +539,13 @@ function buildEntry(r) {
 
   const reqHeaders = parseHeaders(r.requestHeaders);
   const respHeaders = parseHeaders(r.responseHeaders);
+
+  // content.size 是解压后的内容大小,response.bodySize 按 HAR 规范是实际传输
+  // 大小 —— content-length 在 wire 上恰好就是压缩后大小,直接用它。缺失(分块
+  // 传输)时退化为内容大小,compression 记 0。被截断的响应据此保留真实传输
+  // 大小,不再被部分字节数覆盖掉。
+  const contentSize = r.responseBodySize ?? 0;
+  const wireSize = r.wireSize > 0 ? r.wireSize : contentSize;
 
   const entry = {
     startedDateTime: isoString(r.startTime),
@@ -522,7 +569,9 @@ function buildEntry(r) {
       cookies:     parseResponseCookies(r.responseHeaders),
       headers:     respHeaders,
       content: {
-        size:     r.responseBodySize ?? 0,
+        size:     contentSize,
+        // HAR 规范:compression = content.size - bodySize,即压缩省下的字节数
+        compression: contentSize > wireSize ? contentSize - wireSize : 0,
         mimeType: getContentType(r.responseHeaders),
         // filterResponseData 提供的是解压后数据,text 是解压文本;记录原始
         // content-encoding 供逆向者判断传输编码(gzip/br),避免误读
@@ -533,10 +582,13 @@ function buildEntry(r) {
       },
       redirectURL: r.redirectUrl || "",
       headersSize: -1,
-      bodySize:    r.responseBodySize ?? 0
+      bodySize:    wireSize
     },
     cache:   {},
-    timings: { send, wait, receive },
+    // HAR 1.2 要求 timings 带上这些字段,不适用时填 -1。webRequest 不提供
+    // DNS / TCP / SSL 分段耗时,这里如实标注为不可用,而不是省略字段让按规范
+    // 做校验的消费者解析失败。
+    timings: { blocked: -1, dns: -1, connect: -1, ssl: -1, send, wait, receive },
     // --- 逆向上下文扩展字段(下划线前缀,HAR 消费者会忽略未知字段) ---
     _tabId:       r.tabId ?? -1,
     _frameId:     r.frameId ?? -1,
@@ -626,13 +678,17 @@ function buildHAR() {
 
   const log = {
     version: "1.2",
-    creator: { name: "Network Logger", version: "1.2.2" },
+    // 版本号的唯一来源是 manifest.json,不再各处硬编码后漂移
+    creator: { name: "Network Logger", version: api.runtime.getManifest().version },
     entries
   };
   // 注意:downloadHARStream 用 JSON.stringify(log).slice(0,-1) 拼接 entries,
   // 空数组 `"pages":[]` 会被切成 `"pages":[` 导致非法 JSON,因此只有存在
   // page 时才输出 pages 字段。
   if (pages.length) log.pages = pages;
+  // 超过保留条数上限被淘汰的请求数。响应体截断有 _bodyTruncated 标注,条目
+  // 淘汰同样必须留痕 —— 一份"看起来完整但少了请求"的 HAR 对逆向最危险。
+  if (droppedEntryCount > 0) log._droppedEntries = droppedEntryCount;
   return { log };
 }
 
@@ -654,24 +710,62 @@ const SENSITIVE_HEADERS = new Set([
   "x-access-token", "x-session-id", "www-authenticate", "proxy-authenticate"
 ]);
 
-const SENSITIVE_BODY_PATTERNS = [
-  /["']?[Bb]earer\s+[A-Za-z0-9_\-.~+\/]+=*["']?/g,
-  /("(?:password|passwd|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|auth[_-]?token|session[_-]?id|csrf[_-]?token|xsrf[_-]?token)")\s*:\s*"[^"]*"/gi,
-  /(?:password|passwd|secret|token|api_key|access_token|refresh_token|client_secret)=[^&\s]*/gi
+// 每条规则自带替换器,不再靠匹配文本里的 ':' / '=' 猜分隔符。原因:Bearer
+// token 自身的 base64 padding 就是 '=',按"第一个 ="切分会把整个 token 原样
+// 留在 HAR 里(实测 "Authorization: Bearer YWJjZGVmZ2hpamtsbW5vcA==" 会变成
+// "Authorization: Bearer YWJjZGVmZ2hpamtsbW5vcA=[REDACTED]")—— 这正是用户
+// 开启脱敏后最不能出现的结果。
+const SENSITIVE_BODY_RULES = [
+  {
+    // Bearer 凭据:整段(含 "Bearer" 前缀)替换
+    pattern: /["']?[Bb]earer\s+[A-Za-z0-9_\-.~+\/]+=*["']?/g,
+    replace: () => REDACTED
+  },
+  {
+    // JSON 字段:保留键名,只替换值
+    pattern: /("(?:password|passwd|secret|token|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|auth[_-]?token|session[_-]?id|csrf[_-]?token|xsrf[_-]?token)")\s*:\s*"[^"]*"/gi,
+    replace: match => match.substring(0, match.indexOf(":") + 1) + ` "${REDACTED}"`
+  },
+  {
+    // URL-encoded / 表单字段:保留键名。键名候选里不含 '=',第一个 '=' 必然是分隔符
+    pattern: /(?:password|passwd|secret|token|api_key|access_token|refresh_token|client_secret)=[^&\s]*/gi,
+    replace: match => match.substring(0, match.indexOf("=") + 1) + REDACTED
+  }
 ];
+
+function scrubBodyText(text) {
+  if (!text || typeof text !== "string") return text;
+  let scrubbed = scrubJwtLike(text);
+  for (const rule of SENSITIVE_BODY_RULES) {
+    rule.pattern.lastIndex = 0;
+    scrubbed = scrubbed.replace(rule.pattern, rule.replace);
+  }
+  return scrubbed;
+}
 
 const SENSITIVE_QUERY_PARAMS = new Set([
   "token", "access_token", "refresh_token", "api_key", "apikey",
   "key", "secret", "password", "passwd", "session_id", "csrf_token", "auth"
 ]);
 
+// 值本身是 URL 的头部:它们的 query/fragment 里可能带着凭据。典型场景是
+// 魔法链接或 OAuth 回调 —— 落地页 URL 里带 token,之后该页发出的每个请求
+// 都会在 Referer 里重复这个 token;重定向响应则把 token 放在 Location。
+// scrubEntry 已经对 _originUrl / _documentUrl 做了同样的处理,这里补上头部。
+const URL_BEARING_HEADERS = new Set([
+  "referer", "referrer", "location", "content-location", "origin"
+]);
+
 function scrubHeaders(headers) {
   if (!headers || !Array.isArray(headers)) return headers;
-  return headers.map(h =>
-    SENSITIVE_HEADERS.has(String(h.name || "").toLowerCase())
-      ? { name: h.name, value: REDACTED }
-      : h
-  );
+  return headers.map(h => {
+    const name = String(h.name || "").toLowerCase();
+    if (SENSITIVE_HEADERS.has(name)) return { name: h.name, value: REDACTED };
+    if (URL_BEARING_HEADERS.has(name)) {
+      return { name: h.name, value: scrubUrl(String(h.value ?? "")) };
+    }
+    return h;
+  });
 }
 
 function scrubCookies(cookies) {
@@ -679,33 +773,91 @@ function scrubCookies(cookies) {
   return cookies.map(c => ({ ...c, value: REDACTED }));
 }
 
-function scrubJwtLike(text) {
-  // JWT 三段落 base64url(不限定 eyJ 前缀,兼容非标准 header 的 token)。
-  // 注意不能用无界贪婪的 /[A-Za-z0-9_-]{10,}\.\...\.../ —— 它会在不含
-  // 点的长字符串上逐位置回溯,退化为 O(n²)(实测 100KB 需 8s+)。改为用
-  // 前后边界锚定:每个 base64url 段只在起始边界处尝试匹配一次,整体线性。
-  const JWT_RE = /(^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{10,})\.([A-Za-z0-9_-]{10,})\.([A-Za-z0-9_-]{10,})([^A-Za-z0-9_-]|$)/g;
-  return text.replace(JWT_RE, (m, lead, _s1, _s2, _s3, trail) => lead + REDACTED + trail);
+// JWT 三段 base64url(不限定 eyJ 前缀,兼容非标准 header 的 token)。
+//
+// 不能用 /(^|[^A-Za-z0-9_-])(seg)\.(seg)\.(seg)(...)/ 形式的正则:当第三段
+// 不存在时,第二段上的 {10,} 要逐字符回溯去找后面的 '.',回溯深度随该段长度
+// 增长并撑爆 regexp 回溯栈 —— 实测"4MB token 串 + '.' + 4MB token 串"直接抛
+// RangeError: Maximum call stack size exceeded,而 scrubEntry 里的异常会让整次
+// 导出失败(不是只丢一个 body)。解码阈值放宽到 16MB 之后这种巨型文本更容易
+// 进入脱敏路径,所以改为手工扫描。
+//
+// 扫描保持正则的语义:只在每段 token 串的起点尝试,失败就跳到该段末尾,因此
+// 整体线性、无回溯,任意长度都不会溢出。
+const MIN_JWT_SEGMENT = 10;
+const CHAR_DOT = 46; // '.'
+
+// base64url 字符集:A-Z a-z 0-9 _ -(RFC 4648 §5)
+function isTokenChar(code) {
+  return (code >= 48 && code <= 57)      // 0-9
+      || (code >= 65 && code <= 90)      // A-Z
+      || (code >= 97 && code <= 122)     // a-z
+      || code === 95 || code === 45;     // _ -
 }
 
-function scrubBodyText(text) {
-  if (!text || typeof text !== "string") return text;
-  let scrubbed = scrubJwtLike(text);
-  for (const pattern of SENSITIVE_BODY_PATTERNS) {
-    pattern.lastIndex = 0;
-    scrubbed = scrubbed.replace(pattern, match => {
-      const colonIdx = match.indexOf(":");
-      if (colonIdx > -1 && match.startsWith('"')) {
-        return match.substring(0, colonIdx + 1) + ` "${REDACTED}"`;
-      }
-      const eqIdx = match.indexOf("=");
-      if (eqIdx > -1 && !match.startsWith("eyJ")) {
-        return match.substring(0, eqIdx + 1) + REDACTED;
-      }
-      return REDACTED;
-    });
+function scrubJwtLike(text) {
+  if (!text || text.indexOf(".") < 0) return text;
+
+  const pieces = [];
+  let cursor = 0; // 已确认无需改写的部分末尾
+  let i = 0;
+  const len = text.length;
+
+  while (i < len) {
+    const seg1Start = i;
+    while (i < len && isTokenChar(text.charCodeAt(i))) i++;
+    // 该位置不是 token 字符(空段):前进一格,保证下一轮 i 仍是某段的起点
+    if (i === seg1Start) { i++; continue; }
+    if (text.charCodeAt(i) !== CHAR_DOT || i - seg1Start < MIN_JWT_SEGMENT) continue;
+
+    const seg2Start = i + 1;
+    let seg2End = seg2Start;
+    while (seg2End < len && isTokenChar(text.charCodeAt(seg2End))) seg2End++;
+    if (text.charCodeAt(seg2End) !== CHAR_DOT || seg2End - seg2Start < MIN_JWT_SEGMENT) {
+      i = seg2End;
+      continue;
+    }
+
+    const seg3Start = seg2End + 1;
+    let seg3End = seg3Start;
+    while (seg3End < len && isTokenChar(text.charCodeAt(seg3End))) seg3End++;
+    if (seg3End - seg3Start < MIN_JWT_SEGMENT) { i = seg3End; continue; }
+
+    // 三段齐备,且第三段之后必然是非 token 字符或串尾(与正则的尾部边界等价)
+    pieces.push(text.slice(cursor, seg1Start), REDACTED);
+    cursor = seg3End;
+    i = seg3End;
   }
-  return scrubbed;
+
+  if (!pieces.length) return text;
+  pieces.push(text.slice(cursor));
+  return pieces.join("");
+}
+
+// 按 query 串规则脱敏敏感参数值(不含前导 '?' 或 '#')。无变化时返回 null,让
+// 调用方知道这一段不必重写。
+//
+// '?' 与 '&' 同等看待为参数分隔符:参数值里完全可能出现 '?'(最典型的是
+// `#access_token=..&redirect=https://x/?a=1`)。如果只按 '&' 切分,"?" 之后的
+// 内容会被当成同一个值的一部分,参数名解析就此跑偏。分隔符原样保留。
+function scrubQueryLike(raw) {
+  if (!raw) return null;
+  let changed = false;
+  const out = raw.split(/([&?])/).map(seg => {
+    // 分隔符段与空段(连续分隔符)原样保留,不参与参数名判定
+    if (!seg || seg === "&" || seg === "?") return seg;
+    const eq = seg.indexOf("=");
+    const rawName = eq > -1 ? seg.slice(0, eq) : seg;
+    let name = rawName;
+    try { name = decodeURIComponent(rawName); } catch { /* 保留原始 name */ }
+    if (SENSITIVE_QUERY_PARAMS.has(name.toLowerCase())) {
+      changed = true;
+      // 裸参数(无 =)也补上脱敏值,与 queryString 数组解析结果保持一致
+      return `${rawName}=${REDACTED_URL_VALUE}`;
+    }
+    return seg;
+  }).join("");
+  return changed ? out : null;
 }
 
 function scrubUrl(url) {
@@ -716,26 +868,14 @@ function scrubUrl(url) {
     const rest = qIdx === -1 ? "" : url.slice(qIdx);
     const fragIdx = rest.indexOf("#");
     const queryStr = fragIdx > -1 ? rest.slice(0, fragIdx) : rest; // 含 '?'
-    const fragment = fragIdx > -1 ? rest.slice(fragIdx) : "";
+    const fragment = fragIdx > -1 ? rest.slice(fragIdx) : "";      // 含 '#'
     let changed = false;
 
     // 1) query 敏感参数脱敏。只替换参数值,保留 URL 其余部分的原始字符串
     //    形式,不会把非敏感部分的字符表示规范化改写。
-    const scrubbedQuery = queryStr
-      ? queryStr.slice(1).split("&").map(pair => {
-          if (!pair) return pair;
-          const eq = pair.indexOf("=");
-          const rawName = eq > -1 ? pair.slice(0, eq) : pair;
-          let name = rawName;
-          try { name = decodeURIComponent(rawName); } catch { /* 保留原始 name */ }
-          if (SENSITIVE_QUERY_PARAMS.has(name.toLowerCase())) {
-            changed = true;
-            // 裸参数(无 =)也补上脱敏值,与 queryString 数组解析结果保持一致
-            return `${rawName}=${REDACTED_URL_VALUE}`;
-          }
-          return pair;
-        }).join("&")
-      : "";
+    let scrubbedQuery = queryStr.slice(1);
+    const scrubbedParams = scrubQueryLike(scrubbedQuery);
+    if (scrubbedParams !== null) { scrubbedQuery = scrubbedParams; changed = true; }
 
     // 2) userinfo 脱敏:scheme:// 之后、authority 结束(第一个 '/')之前的
     //    '@' 前是用户名[:密码]凭据,泄露即等于明文密码。注意必须在 query
@@ -754,8 +894,23 @@ function scrubUrl(url) {
       }
     }
 
+    // 3) fragment 脱敏。fragment 不是安全区:OAuth implicit flow 把最终 token
+    //    放在 `#access_token=..&state=..`,hash 路由把 query 放在
+    //    `#/path?token=..`,两种都曾被原样写进 HAR。
+    //    这里不再区分"hash 路由 / query 串"——`?` 既可能是路由分隔符,也可能
+    //    是参数值的一部分(`#access_token=..&redirect=https://x/?a=1`),按第一
+    //    个 `?` 切分会让 `?` 之前的敏感参数整段被跳过(实测可泄露 access_token)。
+    //    统一交给 scrubQueryLike 处理,它同时把 `&` 和 `?` 当分隔符。
+    //    只含 [=&?] 之一时才当作参数串,否则普通锚点(`#section-2`、`#token-usage`)
+    //    必须保持原样。
+    let scrubbedFragment = fragment;
+    if (fragment.length > 1 && /[=&?]/.test(fragment)) {
+      const scrubbedHash = scrubQueryLike(fragment.slice(1));
+      if (scrubbedHash !== null) { scrubbedFragment = `#${scrubbedHash}`; changed = true; }
+    }
+
     if (!changed) return url;
-    return `${scrubbedPrefix}${queryStr ? `?${scrubbedQuery}` : ""}${fragment}`;
+    return `${scrubbedPrefix}${queryStr ? `?${scrubbedQuery}` : ""}${scrubbedFragment}`;
   } catch {
     return url;
   }
@@ -791,12 +946,14 @@ function scrubEntry(entry) {
     if (entry.request.postData.text && !entry.request.postData.encoding) {
       entry.request.postData.text = scrubBodyText(entry.request.postData.text);
     }
-    // formData 解析出的结构化参数数组同样可能含密码/token 等敏感字段,
-    // 与 queryString 采用相同的脱敏规则,否则 params 会泄露明文。
+    // formData 解析出的结构化参数数组与 postData.text 是同一份数据
+    // (scrubBodyText 已把 text 里的值替换成 [REDACTED]),必须用同一个占位符,
+    // 否则同一字段在两个视图里显示不同的脱敏标记。URL 串 / queryString 那一对
+    // 继续用 REDACTED_URL_VALUE —— 只有它们会被 URL 编码规范化改写。
     if (Array.isArray(entry.request.postData.params)) {
       entry.request.postData.params = entry.request.postData.params.map(p =>
         SENSITIVE_QUERY_PARAMS.has(String(p.name || "").toLowerCase())
-          ? { name: p.name, value: REDACTED_URL_VALUE }
+          ? { name: p.name, value: REDACTED }
           : p
       );
     }
@@ -813,9 +970,10 @@ function scrubEntry(entry) {
 function onBeforeRequest(details) {
   if (!isRecording) return {};
 
-  if (requests.size >= 50000) {
+  if (requests.size >= MAX_TRACKED_REQUESTS) {
     const oldestKey = requests.keys().next().value;
     requests.delete(oldestKey);
+    droppedEntryCount++;
   }
 
   const body = extractRequestBody(details.requestBody);
@@ -847,6 +1005,7 @@ function onBeforeRequest(details) {
     waitTime:           0,
     receiveTime:        0,
     protocol:           null,
+    wireSize:           -1,
     redirectUrl:        "",
     // --- 逆向上下文(details 直接提供,Firefox 均已支持) ---
     originUrl:          details.originUrl || null,   // 触发请求的来源 URL
@@ -887,17 +1046,22 @@ function onHeadersReceived(details) {
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
   r.responseHeaders = details.responseHeaders || [];
+  // details.protocol 是 "HTTP/1.1" / "HTTP/2" / "HTTP/3" 这类可直接判定的值,
+  // 之前这一项从未写回,httpVersion 只能靠 statusLine 字符串猜。
+  r.protocol = details.protocol || r.protocol;
   // waitTime 定义为"发送完成到收到响应头"的等待时长,减去 sendTime 避免
   // 与 send 阶段重叠,使 HAR timings 三段(send/wait/receive)之和恰好等于
   // 请求总耗时。sendTime 恒在 onHeadersReceived 之前由 onBeforeSendHeaders
   // 写入,即使该事件缺失(值为 0)此式也退化为原来的全量等待时长。
   r.waitTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime);
+  // content-length 是传输大小(压缩后),单独记录:buildEntry 用它填
+  // response.bodySize 并算出 content.compression。不再写进 responseBodySize,
+  // 否则被截断的响应会连真实大小一起丢掉。
+  const contentLength = parseInt(getHeaderValue(details.responseHeaders, "content-length"), 10);
+  if (Number.isFinite(contentLength) && contentLength > 0) r.wireSize = contentLength;
   // 对未捕获响应体(NON_BODY_TYPES)的请求,用 content-length 兜底记录大小;
   // 已捕获的请求会在 finalizeResponseBody 里用真实字节数覆盖此值。
-  if (!r.responseBodySize) {
-    const cl = getHeaderValue(details.responseHeaders, "content-length");
-    if (cl) r.responseBodySize = parseInt(cl, 10) || 0;
-  }
+  if (!r.responseBodySize && r.wireSize > 0) r.responseBodySize = r.wireSize;
 }
 
 function onBeforeRedirect(details) {
@@ -907,6 +1071,7 @@ function onBeforeRedirect(details) {
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
   r.responseHeaders = details.responseHeaders || r.responseHeaders;
+  r.protocol = details.protocol || r.protocol;
   r.redirectUrl = details.redirectUrl || "";
   r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
 }
@@ -917,6 +1082,7 @@ function onCompleted(details) {
   r.status = details.statusCode || r.status;
   r.statusLine = details.statusLine || r.statusLine;
   r.statusText = statusTextFromLine(details.statusLine, details.statusCode);
+  r.protocol = details.protocol || r.protocol;
   r.receiveTime = Math.max(0, details.timeStamp - r.startTime - r.sendTime - r.waitTime);
   // 连接信息:服务器 IP 与是否命中缓存(判断"这请求是否真的走了网络")
   r.ip = details.ip || r.ip;
@@ -1094,7 +1260,13 @@ async function handleMessage(message, sender) {
 
   switch (message.action) {
     case "getStatus":
-      return { isRecording, count: requests.size, startTime: recordingStartTime };
+      return {
+        isRecording,
+        count: requests.size,
+        startTime: recordingStartTime,
+        dropped: droppedEntryCount,
+        resumed: resumedFromStorage
+      };
 
     case "getFeatures":
       return { features: FEATURES };
@@ -1107,6 +1279,8 @@ async function handleMessage(message, sender) {
         // 继续为已丢弃的旧响应白等。旧捕获的 finish() 仍会执行,但已不在
         // 集合中,delete/resolve 均为无害空操作。
         pendingBodyCaptures.clear();
+        droppedEntryCount = 0;
+        resumedFromStorage = false;
         isRecording = true;
         recordingStartTime = Date.now();
         updateBadge();
@@ -1121,13 +1295,15 @@ async function handleMessage(message, sender) {
         await api.storage.local.set({ isRecording: false });
         updateBadge();
       }
-      return { success: true, isRecording: false, count: requests.size };
+      return { success: true, isRecording: false, count: requests.size, dropped: droppedEntryCount };
 
     case "clearRecording":
       requests.clear();
       pendingBodyCaptures.clear();
       isRecording = false;
       recordingStartTime = null;
+      droppedEntryCount = 0;
+      resumedFromStorage = false;
       await api.storage.local.set({ isRecording: false });
       updateBadge();
       return { success: true };
@@ -1154,7 +1330,12 @@ async function handleMessage(message, sender) {
       await downloadHARStream(har, filename);
       const failedCount = har.log.entries.reduce(
         (n, e) => n + ((e.response && e.response.status === 0) ? 1 : 0), 0);
-      return { success: true, count: har.log.entries.length, failedCount };
+      return {
+        success: true,
+        count: har.log.entries.length,
+        failedCount,
+        droppedCount: har.log._droppedEntries || 0
+      };
     }
 
     default:
@@ -1170,10 +1351,15 @@ api.runtime.onMessage.addListener((message, sender) =>
 );
 
 // --- Restore state after background reload ----------------------------------
+// 后台脚本重载(扩展更新 / 浏览器重启)后 requests map 必然为空,而 storage 里的
+// isRecording 仍是 true。继续录制是有用的,但不能让 popup 只看到一个
+// "REC + 0 请求"的假象:重启前抓到的数据已经不在内存里了。resumedFromStorage
+// 随 getStatus 一起返回,由 popup 明确提示。
 api.storage.local.get(["isRecording", "startTime"]).then(result => {
   if (result.isRecording) {
     isRecording = true;
     recordingStartTime = result.startTime || Date.now();
+    resumedFromStorage = true;
     updateBadge();
   } else if (actionApi) {
     ignoreResult(actionApi.setBadgeText({ text: "" }));

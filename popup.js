@@ -42,6 +42,24 @@ const infoText    = document.getElementById("info-text");
 const filenameInput = document.getElementById("filename-input");
 const scrubToggle   = document.getElementById("scrub-toggle");
 
+// 脱敏开关持久化:popup 每次打开都会重建 DOM,不记住选择的话用户每次导出都得
+// 重新勾一次(之前 stop/clear 里的强制复位让同一会话内也会丢失选择)。
+try {
+  scrubToggle.checked = localStorage.getItem("nl-scrub") === "1";
+} catch { /* localStorage 不可用时保持默认关闭 */ }
+scrubToggle.addEventListener("change", () => {
+  try { localStorage.setItem("nl-scrub", scrubToggle.checked ? "1" : "0"); } catch { /* 忽略 */ }
+});
+
+// footer 版本号取自 manifest,避免与 manifest.json / HAR creator 多处硬编码漂移
+(() => {
+  const footer = document.getElementById("footer");
+  if (!footer) return;
+  let version = "";
+  try { version = `v${chrome.runtime.getManifest().version} · `; } catch { /* 上下文失效时省略版本号 */ }
+  footer.textContent = `${version}HAR 1.2 · All data stays local`;
+})();
+
 // ─── State ────────────────────────────────────────────────────────────────────
 let isRecording = false;
 let recordingStartTime = null;
@@ -104,7 +122,7 @@ function setInfo(text, type = "") {
   }
 }
 
-function updateUI(recording, count = 0) {
+function updateUI(recording, count = 0, dropped = 0) {
   isRecording = recording;
   const statsBar = document.querySelector(".stats-bar");
 
@@ -126,7 +144,17 @@ function updateUI(recording, count = 0) {
     if (count > 0) {
       statusBadge.textContent = "● READY";
       statusBadge.className = "status-badge stopped";
-      setInfo(`✅ Captured <strong>${count}</strong> request${count !== 1 ? "s" : ""}. Ready to export.`, "success");
+      // 条目淘汰是静默的(响应体截断至少有 _bodyTruncated 标记),必须显式
+      // 告知用户导出结果不完整,否则他们拿到一份少了请求的 HAR 却毫不知情。
+      if (dropped > 0) {
+        setInfo(
+          `⚠️ Captured <strong>${count}</strong> requests, but <strong>${dropped}</strong> older ` +
+          `one${dropped !== 1 ? "s were" : " was"} dropped by the entry cap — the export will be incomplete.`,
+          "warning"
+        );
+      } else {
+        setInfo(`✅ Captured <strong>${count}</strong> request${count !== 1 ? "s" : ""}. Ready to export.`, "success");
+      }
       btnExport.disabled = false;
       btnClear.disabled = false;
       document.querySelector(".options-panel").style.display = "";
@@ -219,7 +247,10 @@ async function exportHAR() {
     const failNote = res.failedCount
       ? ` · ${res.failedCount} failed request${res.failedCount !== 1 ? "s" : ""}`
       : "";
-    setInfo(`✅ HAR saved — ${res.count} request${res.count !== 1 ? "s" : ""} exported${scrubNote}${failNote}.`, "success");
+    const dropNote = res.droppedCount
+      ? ` · ${res.droppedCount} dropped by the entry cap`
+      : "";
+    setInfo(`✅ HAR saved — ${res.count} request${res.count !== 1 ? "s" : ""} exported${scrubNote}${failNote}${dropNote}.`, "success");
     btnExport.disabled = false;
     btnExport.innerHTML = '<span class="btn-icon">⬇</span> Export as HAR';
   } catch (err) {
@@ -253,8 +284,7 @@ btnStop.addEventListener("click", async () => {
     const res = await sendMsg("stopRecording");
     stopTimer();
     stopPolling();
-    scrubToggle.checked = false;
-    updateUI(false, res.count || 0);
+    updateUI(false, res.count || 0, res.dropped || 0);
   } catch (err) {
     btnStop.disabled = false;
     btnStop.innerHTML = '<span class="btn-icon">■</span> Stop Recording';
@@ -269,7 +299,6 @@ btnClear.addEventListener("click", async () => {
     await sendMsg("clearRecording");
     stopTimer();
     stopPolling();
-    scrubToggle.checked = false;
     elapsedTime.textContent = "00:00";
     updateUI(false, 0);
   } catch (err) {
@@ -281,7 +310,13 @@ btnClear.addEventListener("click", async () => {
 (async () => {
   try {
     const status = await sendMsg("getStatus");
-    updateUI(status.isRecording, status.count || 0);
+    updateUI(status.isRecording, status.count || 0, status.dropped || 0);
+    if (status.isRecording && status.resumed) {
+      // 后台脚本重载(扩展更新 / 浏览器重启)后 requests map 已清空,storage
+      // 里的 isRecording 却仍是 true。不提示的话用户只看到"REC + 0 请求",
+      // 会以为录制正常而实际早已丢了前面抓到的数据。
+      setInfo("⚠️ Recording resumed after a background restart — requests captured before the restart are no longer available.", "warning");
+    }
     if (status.isRecording && status.startTime) {
       startTimer(status.startTime);
       startPolling();
